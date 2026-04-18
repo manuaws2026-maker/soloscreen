@@ -1,6 +1,6 @@
 import Testing
 import Foundation
-@testable import SubtleAI
+@testable import SoloScreen
 
 @Suite("PersistenceService")
 struct PersistenceTests {
@@ -9,7 +9,7 @@ struct PersistenceTests {
     /// Returns the service and the temp directory URL for cleanup.
     private func makeTempService() -> (PersistenceService, URL) {
         let tempDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("SubtleAITests_\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("SoloScreenTests_\(UUID().uuidString)", isDirectory: true)
         let service = PersistenceService(directory: tempDir)
         return (service, tempDir)
     }
@@ -259,7 +259,7 @@ struct PersistenceTests {
     @Test("Data persists across service instances sharing same directory")
     func crossInstancePersistence() async throws {
         let tempDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("SubtleAITests_\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("SoloScreenTests_\(UUID().uuidString)", isDirectory: true)
         defer { cleanup(tempDir) }
 
         // Instance 1: save data
@@ -325,7 +325,7 @@ struct PersistenceTests {
     @Test("storageDirectory returns the configured directory")
     func storageDirectory() async {
         let tempDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("SubtleAITests_\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("SoloScreenTests_\(UUID().uuidString)", isDirectory: true)
         let service = PersistenceService(directory: tempDir)
 
         let dir = await service.storageDirectory

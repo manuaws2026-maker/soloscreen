@@ -1,0 +1,141 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for the Facebook News Feed let me start with the functional requirements.
+
+First, users need to be able to create posts. Second, they need to follow other users. And third, they need to view a feed of posts from people they follow, in reverse chronological order.
+
+For non-functional requirements — we should prioritize availability over consistency here. It's totally fine if a post takes up to a minute to appear in followers' feeds. That's eventual consistency and it's acceptable for a social feed. Posting and viewing should be fast, under 500ms. We need to handle 2 billion users. And users should be able to follow an unlimited number of users and have an unlimited number of followers — this is important because it drives some key architectural decisions around fan-out.
+
+Below the line for now: likes, comments, rich media uploads, and content ranking algorithms.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Users can create posts
+2. Users can follow other users
+3. Users can view a feed of posts from followed users in reverse chronological order
+
+**Non-Functional Requirements:**
+- High availability over consistency: tolerate up to 1 minute of post staleness (eventual consistency)
+- Low latency: posting and viewing feed in < 500ms
+- Massive scale: 2B total users
+- Unlimited follows: users can follow and be followed by unlimited users
+
+**Below the Line (Out of Scope):**
+- Likes, comments, reactions
+- Rich media / image uploads
+- Content ranking algorithms
+- Notifications[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Three core entities here.
+
+A User is anyone in the system. A Follow is a uni-directional link — I follow you, but you don't necessarily follow me back. And a Post is content created by a user that shows up in the feeds of their followers.[/SAY]
+[DETAIL]- **User** : A user in our system.
+- **Follow** : A uni-directional link between users in our system.
+- **Post** : A post made by a user in our system. Posts can be made by any user, and are shown in the feed of users who follow the poster.[/DETAIL]
+--- SECTION: API Design
+[SAY]Okay so three endpoints, one per functional requirement.
+
+First, POST /posts with a content body. I'm keeping the content structure flexible to support rich content later. Returns the new postId.
+
+Second, PUT /users/:id/follow to follow a user. I'm using PUT here because it's idempotent — if someone accidentally taps follow twice, the second request is a no-op. The authenticated user from the JWT is the follower, and the :id in the path is who they're following. Unfollowing would be a DELETE to the same path, but that's out of scope.
+
+Third, GET /feed with pageSize and cursor params for pagination. The cursor is a timestamp representing the oldest post the user has seen. Each page returns N posts older than that timestamp. This gives us clean infinite scroll behavior.
+
+I'm deliberately not spending time on post structure or media attachments — those are straightforward and I'd rather save time for the interesting fan-out challenges.[/SAY]
+[DETAIL]The API is the primary interface that users will interact with. It's important to define the API early on, as it will guide your high-level design. We can build our API by defining the endpoints necessary for each of our functional requirements.
+For our first requirement, we need to create posts:
+We'll leave the content empty to account for rich content or other structured data we might want to include in the post. For authentication, we'll tell our interviewer that authentication tokens are included in the header of the request and avoid going into too much detail there unless requested.
+Moving on, we need to be able to follow people. Let's use a simple RESTFUL PUT endpoint for this. The authenticated user (from their JWT) is the one doing the following, and `[id]` is the user they want to follow.
+Here the follow action is binary. By using PUT we can ensure it is idempotent so it doesn't fail if the user clicks follow twice. Unfollowing (out of scope) would be accomplished with a DELETE. We don't need a body but we'll include a stub just in case and keep moving.
+Our last requirement is to be able to view our feed and page through it.
+This can be a simple GET request. We've included some parameters to allow the user to page through their feed. Since our requirements are to return posts in reverse chronological order, when users page through their feed they'll be looking at increasingly older posts. We'll use a timestamp as a "cursor" to represent the oldest post they've seen so far, so each page will return N posts older than that timestamp.
+We'll avoid diving into the structure of Posts for the moment to give ourselves time for the juicier parts of the interview.
+Especially for more senior candidates, it's important to focus your efforts on the "interesting" aspects of the interview. Spending too much time on obvious elements both deprives you of time for the more interesting parts of the interview but also signals to the interviewer that you may not be able to distinguish more complex pieces from trivial ones: a critical skill for senior engineers. "I'll come back if I have time for this" is a great strategy!
+Ok, we now have some API's, let's work on building the high-level design behind them.
+
+```
+POST /posts
+{
+ "content": { }
+}
+// -> 200 OK
+{
+ "postId": // ...
+}
+```
+
+```
+PUT /users/[id]/follow
+{ }
+// -> 200 OK
+```
+
+```
+GET /feed?pageSize={size}&cursor={timestamp?}
+{
+ items: Post[],
+ nextCursor: string
+}
+```[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, I'd start with PostgreSQL for users and follows since that's relational data we need to query reliably. For posts and feeds though, we'll likely want something that handles high-throughput writes better — I'm thinking DynamoDB or Cassandra for the feed table, since we'll be writing to potentially millions of feed rows every time a popular user posts. I'll get into the specifics when we discuss the fan-out strategy.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me lay out the basic architecture, then we'll dig into the hard parts.
+
+At the simplest level, the client hits an API Gateway which routes to either a Post Service, a Follow Service, or a Feed Service. When a user creates a post, the Post Service writes to the Post table. When a user requests their feed, the Feed Service needs to figure out which posts to show.
+
+The naive approach is fan-out on read — when someone opens their feed, we look up everyone they follow, then query each person's recent posts, merge and sort them. That works for users following a handful of people, but it falls apart when someone follows thousands of accounts. That's the key challenge I want to dig into.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> LB[Load Balancer]
+    LB --> API[API Gateway]
+    API --> Core[Core Service]
+```
+
+**Data Flow:**[/DETAIL]
+--- SECTION: Deep Dive: Handle users who are following a large number of users?
+[SAY]So the core problem is fan-out on read. If I follow 5,000 people and I open my feed, the system has to query 5,000 users' posts, merge them, and sort — all within 500ms. That's not going to work.
+
+The solution is to flip it: fan-out on write. When someone creates a post, we immediately write that post reference into a pre-computed Feed table for every one of their followers. So when I open my feed, it's just a single read from my pre-computed feed — no joins, no merging, instant.
+
+The trade-off is obvious: writes are now more expensive. If someone has 1,000 followers, creating a post triggers 1,000 writes to the Feed table. But since we said we're okay with up to a minute of staleness, these writes can happen asynchronously through a message queue. The user creating the post gets an immediate response, and the feed population happens in the background.
+
+This works great for normal users. But it creates a new problem for users with massive followings — which I'll address next.[/SAY]
+[DETAIL]**Problem:** How do we handle users who are following a large number of users?[/DETAIL]
+--- SECTION: Deep Dive: Handle users with a large number of followers?
+[SAY]Right, so with fan-out on write, when Justin Bieber posts and he has 90 million followers, we'd need to write to 90 million feed records. Even asynchronously, that's a massive amount of work and could blow past our one-minute staleness budget.
+
+The key insight is that we don't have to pick one strategy for everyone. I'd go with a hybrid approach. For normal accounts, we fan out on write — when they post, we push to all followers' feeds asynchronously via a worker queue. For high-follower accounts above some threshold, we flag their follows as "not precomputed."
+
+On the read side, when a user requests their feed, the Feed Service grabs their pre-computed feed and merges it with recent posts from any high-follower accounts they follow. So for most users, we do a tiny bit of fan-out on read — just for the handful of celebrity accounts they follow — merged with their mostly-complete pre-computed feed.
+
+This hybrid gives us the best of both worlds. The async workers handle the fan-out for write using a shared queue, and we autoscale the worker count based on queue depth. The read path stays fast because we're only merging a small number of high-follower account posts with the pre-computed feed.[/SAY]
+[DETAIL]**Problem:** How do we handle users with a large number of followers?
+
+**Solution:** Great Solution: Async Workers with Hybrid Feeds
+ApproachA great option would extend on Async Workers outlined above. We'll create async feed workers that are working off a shared queue to write to our precomputed feeds.Async Workers for Post CreatesBut we can be more clever here: we can choose which accounts we'd like to pre-calculate into feeds and which we do not.For Justin Bieber (and other high-follow accounts), instead of writing to 90+ million followers we can instead add a flag onto the Follow table which indicates that this particular followisn'tprecomputed. In the async worker queue, we'll ignore requests for these users.On the read side, when users request their feed via the Feed Service, we can grab their (partially) precomputed feed from the Feed Table and merge it with recent posts from those accounts which aren't precomputed.This hybrid approach allows us to choose whether we fan out on read or fan out on write on a per-account basis, and for most users we'll do a little of both. This is a great system design principle...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Blast the Requests
+- (Good) Good Solution: Async Workers[/DETAIL]
+--- SECTION: Deep Dive: Handle uneven reads of Posts?
+[SAY]Now there's another problem. Some posts go viral — a celebrity's post might get hundreds of reads per second in the first few hours, while most posts sit at near zero. If we're using DynamoDB or any key-value store for the Post table, this creates a hot key problem. DynamoDB scales well only if load is evenly distributed across the keyspace, and viral posts violate that assumption hard.
+
+I'd put a replicated cache layer in front of the Post table. Since posts are almost never edited after creation, we can set long TTLs and use LRU eviction. The critical design choice is using replicated cache instances rather than a sharded cache. With sharding, a viral post still lives on one shard and that shard becomes the bottleneck. With replication, every cache instance has a copy of the popular post, and a load balancer distributes reads across all instances.
+
+So a viral post's read traffic gets spread across N cache instances instead of hammering one shard. The trade-off is higher memory usage since popular posts are duplicated, but that's cheap compared to the read throughput we gain. And with LRU eviction, unpopular posts naturally get evicted while hot posts stay cached.[/SAY]
+[DETAIL]**Problem:** How can we handle uneven reads of Posts?
+
+**Solution:** Great Solution: Redundant Post Cache
+ApproachLike the Distributed Post Cache above, a great solution for this problem is to insert a cache between the readers of the Post table and the table itself. Since posts are very rarely edited, we can keep a long time to live (TTL) on the posts and have our cache evict posts that are least recently used (LRU). As long as our cache is big enough to house our most popular posts, the vast majority of requests to the Post Table will instead hit our cache.The key difference from the previous approach: instead of ashardedcache (where each post lives on exactly one node), we usereplicatedcache instances where every instance can serve any post. A load balancer distributes requests across these instances, so each one independently handles a fraction of the total traffic.These cache instances don't need to coordinate. Each instance can service the same postID, which means a viral post's read traffic gets spread across all N instances instead of hammering a single shard.This does mean we may ...
+
+**Alternatives considered:**
+- (Good) Good Solution: Post Cache with Large Keyspace[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For the follower fan-out problem, we chose the hybrid approach — fan-out on write for normal accounts, fan-out on read for celebrity accounts. This adds complexity in the read path where we merge two data sources, but it's the only way to handle both extremes without either slow reads or impossibly expensive writes. For the hot post problem, we chose replicated cache instances over a sharded cache. We pay more in memory since popular posts are duplicated across instances, but we eliminate the single-shard bottleneck that would otherwise kill us during viral posts.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Trade-off |
+| --- | --- | --- | --- |
+| Fan-out strategy | Async Workers with Hybrid Feeds | Pure fan-out on write | More complex read path (merge), but avoids writing to 90M+ feeds for celebrity posts |
+| Hot post reads | Redundant Post Cache (replicated) | Sharded Post Cache | Higher memory usage, but eliminates single-shard bottleneck for viral posts |[/DETAIL]
+[/SYSDESIGN]

@@ -1,13 +1,13 @@
 import AppKit
 
-/// Application entry point for SubtleAI.
+/// Application entry point for SoloScreen.
 ///
 /// Uses a manual NSApplication run loop instead of SwiftUI's @main App protocol
-/// because SubtleAI needs direct control over window creation via NSPanel for
+/// because SoloScreen needs direct control over window creation via NSPanel for
 /// stealth mode (sharingType = .none). The AppDelegate handles all setup:
 /// status bar item, stealth window, keyboard shortcuts, and app state.
 @main
-struct SubtleAIApp {
+struct SoloScreenApp {
     static func main() {
         let app = NSApplication.shared
         let delegate = AppDelegate()

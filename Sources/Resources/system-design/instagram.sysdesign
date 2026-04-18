@@ -1,0 +1,158 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for Instagram let me start with the functional requirements — the core things we need to build.
+
+First, users need to create posts with photos or videos and a caption. Second, users need to follow other accounts — and this is unidirectional, so I can follow someone without them following me back. Third, users need to see a chronological feed of posts from the people they follow.
+
+For non-functional requirements — the feed needs to load fast, under 500ms. We're targeting 500 million daily active users, so this needs to scale massively. We're prioritizing availability over consistency — it's okay if a new post takes a few seconds to appear in followers' feeds. And we need to handle large media files efficiently — photos up to 8MB and videos up to 4GB.
+
+Things I'm putting below the line for now: stories, reels, direct messages, search and explore, and like/comment functionality.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Users can create posts with photos, videos, and captions
+2. Users can follow other users (unidirectional relationship)
+3. Users can view a chronological feed of posts from followed users
+
+**Non-Functional Requirements:**
+- Low-latency feed: < 500ms to load
+- High availability: prioritize availability over consistency
+- Scale: 500M DAU, billions of posts
+- Media support: photos up to 8MB, videos up to 4GB
+
+**Below the Line (Out of Scope):**
+- Stories and reels
+- Direct messaging
+- Search and explore
+- Likes, comments, and engagement features[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Let me define the core entities. We've got four.
+
+A User stores profile info — username, bio, that kind of thing. A Post includes a reference to the media file, a caption, and who created it. Importantly, a single Post entity handles both photos and videos. Media represents the actual bytes — the image or video file. This goes to S3, not a traditional database. And a Follow represents the unidirectional relationship between a follower and a followee.[/SAY]
+[DETAIL]- **User:** This entity will store user information like username, profile details, etc. (We'll keep it minimal for now).
+- **Post:** This will include a reference to the media file, a caption, and the user who created it. Crucially, a single Post entity will handle BOTH photos and videos.
+- **Media:** Represents the actual bytes of the media file. We'll use S3 for this.
+- **Follow:** Represents the relationship between two users, where one user (the follower) is following another user (the followee). This captures the uni-directional "follow" relationship.[/DETAIL]
+--- SECTION: API Design
+[SAY]Okay so three main endpoints.
+
+First, POST /posts for creating a post. The client sends the media and a caption. Now, in practice we'll handle the actual media upload separately using pre-signed S3 URLs — I'll cover why when we get into the media deep dive. For now, the client gets back a postId.
+
+Second, POST /follows for following a user. The body just has the followedId. The follower's identity comes from the auth token — we never trust client-supplied user IDs.
+
+Third, GET /feed with cursor-based pagination. This returns an array of posts and a next_cursor for fetching the next page. Cursor-based pagination is better than offset-based here because new posts are constantly being added, which would shift offsets.[/SAY]
+[DETAIL]The API is the main way users will interact with Instagram. Defining it early helps us structure the rest of our design. We'll start simple and, as always, we can add more detail as we go. I'll just create one endpoint for each of our core requirements.
+First, users need to create posts. We'll use a `POST` request for that:
+We're going to handle the actual upload of the photo or video separately, using a pre-signed URL. I'll get into the details of why we do that later, when we talk about handling large files. For now, I'm just focusing on the basic API to create the post metadata. We can assume the client gets a postId back, which it'll use later.
+Next, users need to follow other users. We'll model this as a relationship resource:
+The follower's ID will be extracted from the authentication token (JWT or session), so we don't need to specify it in the request body. This is both more secure and follows the principle of least privilege. In practice, it's fine to include here, you'll just need to compare it to the session before following.
+Finally, users need to see their feed. This is a GET request:
+We'll use a `cursor` for pagination, and a `limit` to control the page size. I'm keeping the details of the posts array vague for now – we can fill that in later. The important thing is that we return an array of posts, and a `next_cursor` for getting the next page.
+
+```
+POST /posts -> postId
+{
+ "media": {photo or video bytes},
+ "caption": "My cool photo!",
+}
+```
+
+```
+POST /follows
+{
+ "followedId": "123"
+}
+```
+
+```
+GET /feed?cursor={cursor}&limit={page_size} -> Post[]
+```[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, I'd use PostgreSQL for users and follows — we need strong consistency for the social graph, and follows are inherently relational. For posts, I could go either way — Postgres or DynamoDB. Given the read-heavy access pattern and scale, DynamoDB with postId as the partition key works well.
+
+Media files go to S3. And for the feed — which I'll get into in the deep dives — we'll use Redis to store precomputed feed data for fast retrieval.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through the architecture one requirement at a time.
+
+For creating posts — the client hits our API Gateway through a load balancer, which routes to a Post Service. The service stores the post metadata in the database and triggers the media upload flow via pre-signed URLs to S3.
+
+For following — the Post Service writes the follow relationship to the database. Simple write operation.
+
+For the feed — this is where it gets interesting. The simplest approach is fan-out on read: when a user opens their feed, query the follows table to get everyone they follow, then fetch recent posts from each of those accounts, merge and sort by timestamp. This works for small scale, but for users following 1000+ accounts, we're doing 1000+ queries per feed load. That's not going to fly at 500 million DAU. I'll address this in the deep dives.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> CDN[CDN]
+    Client --> LB[Load Balancer]
+    LB --> API[API Gateway]
+    API --> PostSvc[Post Service]
+    API --> FeedSvc[Feed Service]
+    API --> FollowSvc[Follow Service]
+    PostSvc --> Blob[(S3 blob store)]
+    PostSvc --> PostDB[(Postgres — metadata)]
+    FeedSvc --> FeedCache[(Redis — per-user feed)]
+    FollowSvc --> GraphDB[(DynamoDB — follow graph)]
+    PostSvc --> Kafka[[Kafka]]
+    Kafka --> Fanout[Fanout Worker]
+    Fanout --> FeedCache
+```
+
+**Data Flows:**
+
+**Create post (Req #1):** Client → API Gateway → Post Service → S3 (media) + Postgres (metadata) → emit `post.created` to Kafka → Fanout Worker writes entry into each follower's Redis feed list.
+
+**Follow / unfollow (Req #2):** Client → API Gateway → Follow Service → DynamoDB (follower_id → followee_id).
+
+**View feed (Req #3):** Client → API Gateway → Feed Service → Redis feed list (pre-materialized) → hydrate posts from Postgres + S3 URLs → return.[/DETAIL]
+--- SECTION: Deep Dive: The system should deliver feed content with low latency (...
+[SAY]So our naive fan-out-on-read approach won't scale. For users following 1000+ accounts, we'd need 1000+ database queries per feed request. At 500 million DAU, that's catastrophic.
+
+The solution I'd go with is a hybrid approach — combining fan-out-on-write for regular users with fan-out-on-read for celebrities.
+
+Here's how it works. We set a threshold, say 100,000 followers. When a regular user — someone with fewer than 100K followers — creates a post, we asynchronously push that post into a precomputed feed list in Redis for each of their followers. So when a follower opens their feed, it's already waiting in Redis. Fast read, done.
+
+But for celebrities with millions of followers, fan-out-on-write would mean writing to millions of feed lists per post — massive write amplification. So we don't precompute for them. Instead, when a user loads their feed, they get their precomputed feed from Redis and then merge in recent posts from the celebrities they follow by querying the Posts table directly.
+
+This gives us the best of both worlds — fast reads for the vast majority of feed content, and manageable write amplification even for accounts with millions of followers.[/SAY]
+[DETAIL]**Problem:** The system should deliver feed content with low latency (< 500ms )
+
+**Solution:** Great Solution: Hybrid Approach (Precompute + Real-time)
+ApproachWe can address the main limitation of the precompute approach, that celebrities will result in massive write amplification, by using a hybrid approach. We combine fanout-on-write for most users with fanout-on-read for popular accounts. This provides a good balance: fast reads for most users and manageable write amplification.Here's how it works: We define a threshold for the number of followers. Let's say, 100,000 followers. For users with fewer than 100,000 followers, we precompute their followers' feeds just like in the "good" approach above. For users with more than 100,000 followers (the "celebrities"), we DON'T precompute their posts into their followers' feeds.Instead:When a "celebrity" posts, we add the post to thePoststable and do not trigger an asynchronous feed update for their followers.When a user requests their feed: We fetch the precomputed portion of their feed from Redis (posts from users with < 100,000 followers). Then, we also query thePoststable for recent po...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Simple Caching (Improvement on Fan-out on Read)
+- (Good) Good Solution: Precompute Feeds (Fan-out on Write)[/DETAIL]
+--- SECTION: Deep Dive: The system should render photos and videos instantly, sup...
+[SAY]So we need to handle photos up to 8MB and videos up to 4GB, and render them near-instantly on the client. Two challenges here — upload efficiency and download latency.
+
+The approach I'd go with is CDN with dynamic media optimization. When media is uploaded, a processing service generates multiple variants optimized for different devices and network conditions. For images, that means different resolutions and modern formats like WebP. For videos, we create multiple quality levels with adaptive streaming — similar to what we'd do in a YouTube design.
+
+The CDN then serves the right variant based on the requesting device and network conditions. A mobile user on 4G gets a smaller image than a desktop user on fiber. For viral content, we cache aggressively at edge locations worldwide. Less popular content has shorter TTLs.
+
+For the upload side, large videos use chunked uploads with pre-signed S3 URLs — same pattern as Dropbox and YouTube. The media processing pipeline runs asynchronously after upload completes.[/SAY]
+[DETAIL]**Problem:** The system should render photos and videos instantly, supporting photos up to 8mb and videos up to 4GB
+
+**Solution:** Great Solution: CDN with Dynamic Media Optimization
+ApproachThe most effective solution combines CDN distribution with dynamic media optimization. When media is uploaded, we use a media processing service (like Cloudinary or Imgix) to generate multiple variants optimized for different devices and network conditions. For images, this includes different resolutions and formats like WebP for supported browsers. For videos, we create multiple quality levels and use adaptive streaming (more details in theYouTubebreakdown).The CDN then serves these optimized variants based on the requesting device and network conditions. Mobile users automatically receive appropriately sized images, while desktop users get higher resolution versions. The client includes device information and network conditions in its requests, allowing the CDN to serve the most appropriate variant.We also implement intelligent caching strategies. Popular media is cached more aggressively at edge locations, while less accessed content might have shorter TTLs. For viral conten...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Direct S3 Serving
+- (Good) Good Solution: Global CDN Distribution[/DETAIL]
+--- SECTION: Deep Dive: The system should be scalable to support 500M DAU
+[SAY]We've been building with scale in mind throughout, so let me summarize the key decisions that get us to 500 million DAU.
+
+The hybrid feed approach is the cornerstone — precomputed feeds in Redis for the common case means feed loads are essentially a cache read, sub-millisecond. The real-time merge for celebrity posts adds a few database queries, but that's bounded by how many celebrities a user follows.
+
+The CDN handles the media delivery at global scale. Popular content gets served from edge locations, taking the load off our origin servers. Dynamic media optimization means we're serving the smallest possible payload for each device.
+
+The Post Service and Feed Service are stateless and horizontally scalable. The database layer — PostgreSQL for the social graph, DynamoDB or Cassandra for posts — shards naturally by userId and postId respectively. Redis for feed storage can be sharded by userId.
+
+The one thing I'd add at this scale is regional deployment — running the full stack in multiple geographic regions with geo-routing to minimize latency for users worldwide.[/SAY]
+[DETAIL]**Problem:** The system should be scalable to support 500M DAU[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For feed generation, the hybrid fan-out approach adds architectural complexity — we need to handle two different paths and define celebrity thresholds — but it's the only way to get fast reads without crushing write amplification. For media delivery, CDN with dynamic optimization is expensive but essential at 500M DAU. Direct S3 serving would be simpler but would collapse under the load and be slow for global users. And for the feed store, Redis gives us sub-millisecond reads but everything is in memory — that's costly at scale, but the latency requirement justifies it.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Why |
+| --- | --- | --- | --- |
+| The system should deliver feed content with low la | Great Solution: Hybrid Approach (Precompute + Real-time) | Good Solution: Precompute Feeds (Fan-out on Write) | Better scalability and reliability |
+| The system should render photos and videos instant | Great Solution: CDN with Dynamic Media Optimization | Good Solution: Global CDN Distribution | Better scalability and reliability |[/DETAIL]
+[/SYSDESIGN]

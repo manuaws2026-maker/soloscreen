@@ -5,7 +5,7 @@ import NaturalLanguage
 ///
 /// Uses Apple's NaturalLanguage framework for sentence embeddings — fully on-device,
 /// no API calls needed. Stores vectors in memory with periodic JSON persistence
-/// to `~/Library/Application Support/SubtleAI/vector_store.json`.
+/// to `~/Library/Application Support/SoloScreen/vector_store.json`.
 actor VectorStoreService {
 
     // MARK: - Types
@@ -72,7 +72,7 @@ actor VectorStoreService {
             in: .userDomainMask
         ).first ?? FileManager.default.temporaryDirectory
 
-        let baseDir = appSupport.appendingPathComponent("SubtleAI", isDirectory: true)
+        let baseDir = appSupport.appendingPathComponent("SoloScreen", isDirectory: true)
         storeFileURL = baseDir.appendingPathComponent("vector_store.json")
 
         // Load persisted entries synchronously on init.

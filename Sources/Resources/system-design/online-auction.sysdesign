@@ -1,0 +1,160 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for an online auction system, let me start with the functional requirements.
+
+First, users need to be able to post an item for auction with a starting price and an end date. Second, users should be able to place bids on active auctions, and bids are only accepted if they're higher than the current highest bid. Third, users need to view an auction including the current highest bid in real time.
+
+For non-functional requirements — bid consistency is critical. We absolutely cannot have two users both think they won with the same bid amount, so we need strong consistency on bid acceptance. The system should handle at least 10 million concurrent auctions. Real-time bid updates should reach viewers within a few seconds. And we need fault tolerance on bids — dropping a bid is unacceptable.
+
+Below the line for now: payment processing, seller verification, item shipping, and search/discovery.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Users can post an item for auction with a starting price and end date
+2. Users can place bids on active auctions (accepted only if higher than current max bid)
+3. Users can view an auction including the current highest bid in real time
+
+**Non-Functional Requirements:**
+- Strong consistency: no two bids can be accepted at the same price; no race conditions
+- Scale: support ~10M concurrent auctions
+- Real-time updates: bid changes visible to viewers within 2-3 seconds
+- Fault tolerance: zero bid loss, even during failures
+- Low-latency reads: auction pages load in < 200ms
+
+**Below the Line (Out of Scope):**
+- Payment processing and escrow
+- Seller verification and trust scoring
+- Item shipping and logistics
+- Search and discovery of auctions[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Let me define the core entities. We've got four main ones.
+
+An Auction represents an active listing — it has a starting price, end date, current status, and a reference to the item being sold. I'd also store the current max bid directly on the auction row, which becomes important later for consistency.
+
+An Item is the thing being auctioned — name, description, images, category.
+
+A Bid tracks each individual bid placed — the amount, the user who placed it, which auction it's for, and whether it was accepted or rejected.
+
+And a User is anyone on the platform, either a seller creating auctions or a bidder placing bids.[/SAY]
+[DETAIL]- **Auction** : This represents an auction for an item. It would include information like the starting price, end date, and the item being auctioned.
+- **Item** : This represents an item being auctioned. It would include information like the name, description, and image.
+- **Bid** : This represents a bid on an auction. It would include information like the amount bid, the user placing the bid, and the auction being bid on.
+- **User** : This represents a user of the system who either starts an auction or bids on an auction.[/DETAIL]
+--- SECTION: API Design
+[SAY]Okay so the API is pretty straightforward here. First, a POST to /auctions that takes item details, start date, end date, and starting price — this creates both the Auction and Item records and returns the created auction.
+
+Second, POST to /auctions/:auctionId/bids with the bid amount. The server validates that the bid exceeds the current max and returns the created bid with an accepted or rejected status. The userId comes from the session token, not the request body.
+
+Third, GET /auctions/:auctionId to view an auction with its item details and current highest bid. This is the read path that needs to be fast.[/SAY]
+[DETAIL]Let's define our API before getting into the high-level design, as it establishes the contract between our client and system. We'll go through each functional requirement and define the necessary APIs.
+For creating auctions, we need a POST endpoint that takes the auction details and returns the created auction:
+For placing bids, we need a POST endpoint that takes the bid details and returns the created bid:
+For viewing auctions, we need a GET endpoint that takes an auctionId and returns the auction and item details:
+
+```
+POST /auctions -> Auction & Item
+{
+ item: Item,
+ startDate: Date,
+ endDate: Date,
+ startingPrice: number,
+}
+```
+
+```
+POST /auctions/:auctionId/bids -> Bid
+{
+ Bid
+}
+```
+
+```
+GET /auctions/:auctionId -> Auction & Item
+```[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, I'd use PostgreSQL for everything transactional — auctions, items, bids, users. We need ACID guarantees especially around bid acceptance where consistency is non-negotiable.
+
+I'd also store the current max bid directly on the Auction table row. This becomes our fast-path for bid validation — instead of scanning all bids to find the max, we just read one row. I'll dig into why this matters in the deep dives.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through the architecture one requirement at a time.
+
+For posting auctions, the client hits our API Gateway through a load balancer, which routes to an Auction Service. That service validates the input, creates the Auction and Item records in Postgres, and returns the result.
+
+For placing bids, same entry path, but we route to a separate Bidding Service. I'm keeping this separate because bidding has very different consistency and throughput requirements than auction CRUD. The Bidding Service validates the bid against the current max, writes it to the database, and returns accepted or rejected.
+
+For viewing auctions, the Auction Service handles reads. For the real-time highest bid display, we'll need something beyond simple polling — but I'll cover that in the deep dives.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> LB[Load Balancer]
+    LB --> AG[API Gateway]
+    AG --> AS[Auction Service]
+    AG --> BS[Bidding Service]
+    AS --> PG[(PostgreSQL)]
+    BS --> PG
+    BS --> MQ[Message Queue]
+    MQ --> NS[Notification Service]
+    NS --> Client
+```
+
+**Data Flow:**
+1. **Post auction**: Client → API Gateway → Auction Service → PostgreSQL → response
+2. **Place bid**: Client → API Gateway → Bidding Service → validates against max bid → PostgreSQL → response
+3. **View auction**: Client → API Gateway → Auction Service → PostgreSQL → response with current highest bid[/DETAIL]
+--- SECTION: Deep Dive: Ensure strong consistency for bids?
+[SAY]This is the heart of the problem. Let me walk through why naive approaches fail first.
+
+If we just query all bids to find the current max and then insert the new bid, we have a classic race condition — two concurrent bids could both read the same max, both think they're higher, and both get accepted. That's broken.
+
+The approach I'd go with is storing the max bid directly on the Auction row and using it as our synchronization point. Here's the flow: we lock the auction row, read the max bid, compare with the incoming bid, write the bid as accepted or rejected, update the max bid if needed, and commit the transaction. We're only locking one row, and it's a short-duration lock.
+
+Even better, we can use optimistic concurrency control instead of pessimistic locking. We read the auction row with its current version, do our comparison, and on write we include a WHERE clause checking the version hasn't changed. If someone else got there first, we retry. OCC works great here because bid conflicts on the same auction at the same millisecond are actually pretty rare.[/SAY]
+[DETAIL]**Problem:** How can we ensure strong consistency for bids?
+
+**Solution:** Great Solution: Cache max bid in database
+ApproachWe solved the issue with locking a lot of rows for a long time by moving the max bid to a cache, but that introduced a new issue with consistency between the cache and the database. We can solve both problems by storing the max bid in the database. Effectively using theAuctiontable as our cache.Now, our flow looks like this:Lock the auction row for the given auction (just one row)Read the max bid for the given auction from theAuctiontable.Write the bid to the database with a status of accepted or rejected.Update the max bid in theAuctiontable if the new bid is higher.Commit the transaction.We now only lock a single row and for a short duration. If we want to avoid pessimistic locking altogether, we can useoptimistic concurrency control (OCC).OCC is ideal for our system because bid conflicts are relatively rare (most bids won't happen simultaneously on the same auction). Here's how it works:Read the auction row and get the current max bid (this is what is referred to as the 'ver...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Row Locking with Bids Query
+- (Good) Good Solution: Cache max bid externally[/DETAIL]
+--- SECTION: Deep Dive: Ensure that the system is fault tolerant and durable?
+[SAY]Okay so dropping a bid is absolutely unacceptable. Imagine a user places the winning bid and it just vanishes because a server crashed — that destroys trust instantly.
+
+The solution is to get bids into a durable message queue as fast as possible. When a bid comes in, we write it to Kafka immediately. Even if the Bidding Service crashes right after, the bid is safely persisted in the queue. A consumer picks it up, processes it against the database, and confirms the result.
+
+Think of it like a restaurant waiting list — even if the host takes a break, your name is still on the list. The queue gives us durability, and we process bids in order within each auction's partition. We commit the Kafka offset only after the bid is fully processed and persisted in Postgres.[/SAY]
+[DETAIL]**Problem:** How can we ensure that the system is fault tolerant and durable?[/DETAIL]
+--- SECTION: Deep Dive: Ensure that the system displays the current highest bid i...
+[SAY]Right, so for the real-time bid display, our initial approach of clients polling every few seconds has some clear problems. It's too slow for a hot auction where bids are flying in, and it's wasteful because most polls return unchanged data.
+
+I'd go with Server-Sent Events here. When a user opens an auction page, the browser establishes a single SSE connection. On the server side, whenever a new bid is accepted for that auction, we push the updated max bid to all connected clients for that auction. True real-time, no wasted requests.
+
+SSE is a better fit than WebSockets here because the data flow is unidirectional — server to client. We don't need bidirectional communication just to push bid updates. It's simpler to implement, works through most proxies and firewalls, and auto-reconnects on connection drops.[/SAY]
+[DETAIL]**Problem:** How can we ensure that the system displays the current highest bid in real-time?
+
+**Solution:** Great Solution: Server-Sent Events (SSE)
+ApproachServer-Sent Events (SSE)provides a more elegant solution for real-time bid updates. SSE establishes a unidirectional channel from server to client, allowing the server to push updates whenever they occur without requiring the client to poll or maintain multiple connections.When a user views an auction, their browser establishes a single SSE connection. The server can then push new maximum bid values through this connection whenever they change. This creates a true real-time experience while being more efficient than both regular polling and long polling.The client-side implementation is remarkably simple:const eventSource = new EventSource(`/api/auctions/${auctionId}/bid-stream`);
+
+eventSource.onmessage = (event) => {
+ const { maxBid } = JSON.parse(event.data);
+ updateUI(maxBid);
+};On the server side, we maintain a set of active SSE connections for each auction. When a new bid is accepted, we push the updated maximum bid to all connected clients for that auction. The server imp...
+
+**Alternatives considered:**
+- (Good) Good Solution: Long polling for max bid[/DETAIL]
+--- SECTION: Deep Dive: Ensure that the system scales to support 10M concurrent a...
+[SAY]Now for scaling to 10 million concurrent auctions. Let me think through this left to right across the architecture.
+
+The API Gateway and load balancer scale horizontally — no problem there. The Auction Service is mostly reads, so we can add read replicas for Postgres and throw a Redis cache in front for hot auctions.
+
+The Bidding Service is the bottleneck. Each bid needs a database write with row-level locking. But the key insight is that bids are partitioned naturally by auction — bids on different auctions don't contend with each other at all. So we can shard our database by auctionId. Each shard handles a fraction of the total auctions, and within each shard, concurrent bids on the same auction are serialized by the row lock — which is exactly what we want.
+
+For SSE connections, we'd use a pub/sub layer like Redis Pub/Sub so that any server instance can broadcast bid updates regardless of which instance the viewer is connected to.[/SAY]
+[DETAIL]**Problem:** How can we ensure that the system scales to support 10M concurrent auctions?[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For bid consistency, we chose storing the max bid on the auction row with OCC over external caching — we traded a tiny bit of write performance for eliminating cache-database consistency issues entirely. For real-time updates, we chose SSE over long polling — slightly more server resources to maintain persistent connections, but true real-time experience with no wasted requests. And for fault tolerance, adding Kafka gives us bid durability at the cost of some additional infrastructure complexity and a small amount of processing latency.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Why |
+| --- | --- | --- | --- |
+| How can we ensure strong consistency for bids? | Great Solution: Cache max bid in database | Good Solution: Cache max bid externally | Better scalability and reliability |
+| How can we ensure that the system displays the cur | Great Solution: Server-Sent Events (SSE) | Good Solution: Long polling for max bid | Better scalability and reliability |[/DETAIL]
+[/SYSDESIGN]

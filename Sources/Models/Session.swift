@@ -7,6 +7,13 @@ struct Session: Identifiable, Codable, Equatable {
     var messages: [Message]
     var projectId: UUID?
     var model: String
+    /// Overrides the default system prompt for this session when non-nil.
+    /// Copied in from the selected chat template at creation time.
+    var systemPrompt: String?
+    /// Displayed as a pill in the chat top bar (e.g., "Coding Help").
+    var templateName: String?
+    /// SF Symbol for the template pill.
+    var templateIcon: String?
     let createdAt: Date
     var updatedAt: Date
 
@@ -16,6 +23,9 @@ struct Session: Identifiable, Codable, Equatable {
         messages: [Message] = [],
         projectId: UUID? = nil,
         model: String = "gpt-4o-mini",
+        systemPrompt: String? = nil,
+        templateName: String? = nil,
+        templateIcon: String? = nil,
         createdAt: Date = Date(),
         updatedAt: Date = Date()
     ) {
@@ -24,6 +34,9 @@ struct Session: Identifiable, Codable, Equatable {
         self.messages = messages
         self.projectId = projectId
         self.model = model
+        self.systemPrompt = systemPrompt
+        self.templateName = templateName
+        self.templateIcon = templateIcon
         self.createdAt = createdAt
         self.updatedAt = updatedAt
     }

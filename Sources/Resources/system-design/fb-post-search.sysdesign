@@ -1,0 +1,131 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for Facebook post search, let me start with the functional requirements.
+
+First, users need to be able to create posts and like posts — that's our write path. Second, users should be able to search posts by keyword. And third, search results should be sortable by recency or by like count.
+
+For non-functional requirements — search needs to be fast, median queries under 500ms. We need to handle high throughput given Facebook's scale, probably billions of searches per day. New posts should become searchable within about a minute. And all posts need to be discoverable, even old or unpopular ones, though we can take more time for those.
+
+Below the line for now: personalized search results, content moderation, and privacy filtering.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Users can create posts and like posts
+2. Users can search posts by keyword
+3. Search results can be sorted by recency or like count
+
+**Non-Functional Requirements:**
+- Low-latency search: median queries < 500ms
+- High throughput: support billions of searches per day (~3B DAU)
+- Near-real-time indexing: new posts searchable within < 1 minute
+- All posts discoverable, including old or unpopular posts (can tolerate higher latency for these)
+
+**Below the Line (Out of Scope):**
+- Personalized search ranking
+- Content moderation and filtering
+- Privacy-aware search (friend-only posts, etc.)[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Let me define the core entities. We've got three.
+
+A User creates posts — pretty straightforward. A Post is the thing we're actually searching — it has content, is created by a user, and implicitly has a like count. And a Like represents when a user likes a post. For our purposes, we mostly care about the aggregate like count rather than individual like records.[/SAY]
+[DETAIL]- **User** : This entity creates posts.
+- **Post** : This is the thing that we're searching! It has a `content` , is created by a `user` , and implicitly has a like count.
+- **Like** : Likes are created when a user likes a post, but for this problem we mostly care about the *count* of likes.[/DETAIL]
+--- SECTION: API Design
+[SAY]Okay so the APIs are pretty straightforward here. We've got two paths — a write path and a read path.
+
+For writes, a POST to /posts to create a new post, and a POST to /posts/{postId}/likes to like a post. In a real system these might come from a Kafka stream rather than direct API calls, but for clarity I'll model them as endpoints.
+
+For reads, a GET to /search with a query string, a sort parameter for recency or likes, and pagination. That's really it — the complexity here is all in how we build and maintain the search index behind that endpoint.[/SAY]
+[DETAIL]Getting a handle on the APIs for our system is going to provide a scaffolding for the rest of our solution. Most of the time, our job is to make the connection between APIs and storage systems or dependencies, and this case is no different.
+Our APIs are straightforward. We have two paths: a query path for searching and a write path for creating posts and likes.
+In a real system we might be consuming from a Kafka stream or some other event bus for both of these events, but for clarity we'll create separate API endpoints for each and can let our interviewer know that we'd elect to merge these into the rest of the system as appropriate.
+API
+With these APIs defined, we can start to see the shape of our system. Writes come in via the two write endpoints and are written to a database. Queries come in via the search endpoint and read from the database. Good start![/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, I'd use PostgreSQL for our core entities — users, posts, likes — since we need transactional consistency for writes.
+
+But the interesting storage choice is for the search index itself. We'll need an in-memory reverse index — mapping keywords to lists of post IDs — to hit our 500ms latency target. I'll go deeper on that in the high-level design and deep dives.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through the architecture one requirement at a time.
+
+For post creation and likes — these writes come through the API Gateway to a Post Service and Like Service respectively. These are existing services in Facebook's ecosystem, so we take them as given. Our job is building the search layer on top.
+
+For keyword search — we need an Ingestion Service that listens for new posts, tokenizes the content into keywords, and writes those into our reverse index. Then a Search Service handles incoming queries by looking up keywords in the index and returning matching posts.
+
+Now for sorting by recency or likes — this is where it gets interesting. We actually need two separate indexes: one sorted by creation time and one sorted by like count. When a search comes in, we pick the right index based on the sort parameter. The creation index is straightforward to maintain, but the likes index needs updates every time a post gets a new like.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> LB[Load Balancer]
+    LB --> API[API Gateway]
+    API --> Post[Post Service]
+    API --> OurIngestion[Our Ingestion Service]
+    API --> Like[Like Service]
+    API --> TheIngestion[The Ingestion Service]
+    API --> ASingle[A Single Service]
+    Post --> Redis[(Redis)]
+    ASingle --> MySQL[(MySQL)]
+    ASingle --> Database[(Database)]
+```
+
+**Data Flow:**
+1. 1) Users should be able to create and like posts.
+2. 2) Users should be able to search posts by keyword.
+3. 3) Users should be able to get search results sorted by recency or like count.[/DETAIL]
+--- SECTION: Deep Dive: Handle the large volume of requests from users?
+[SAY]So our in-memory reverse index is fast, but we're dealing with massive read traffic. The key insight is two things from our requirements that work in our favor: there's no personalization, so identical queries return identical results. And we have a one-minute window before new posts need to appear.
+
+That means we can cache aggressively. I'd put a CDN in front of the search endpoint. We set cache-control headers with a TTL of about 60 seconds. When a user searches for "Taylor Swift", the CDN serves the cached result if it exists. If not, the request goes through to our search service, and the response gets cached for the next user.
+
+The CDN handles this beautifully because most CDNs have edge locations close to users, so cache hits come back in 10-20 milliseconds versus the 100+ milliseconds for a full roundtrip to our service. During high-traffic events — like during a major live event — this absorbs the vast majority of duplicate queries.[/SAY]
+[DETAIL]**Problem:** How can we handle the large volume of requests from users?
+
+**Solution:** Great Solution: Use a CDN to cache at the edge
+ApproachIn addition to the Redis search cache, we can also utilize edge caching via a Content Delivery Network (CDN) like Cloudflare or AWS Cloudfront. Most CDNs operate like a big set of geographically-spread HTTP caches. You configure an "origin" or target for the cache and configure DNS to route through the CDN. If the cache has the item the user is looking for, it can return it faster than almost any alternative option: most CDNs have locations very close to most users. If it doesn't hit the cache, the CDN will proxy the request back to your servers to handle.Using the CDN here is simple: on the response to our/searchendpoint, we can addcache-controlheaders which tell our CDN when and for how long to cache a result. When a user tries to hit our search service, they'll first go through a geographically local CDN host. In the case of a cache hit, these users will get results in 10s of milliseconds vs the 100s which might have been required if they had to go through our API gateway, t...
+
+**Alternatives considered:**
+- (Good) Good Solution: Use a distributed cache alongside our search service[/DETAIL]
+--- SECTION: Deep Dive: Handle multi-keyword, phrase queries?
+[SAY]Right, so users won't always search for a single word. They'll search for "Taylor Swift" or "all your base are belong to us." The challenge with our reverse index is that looking up "Taylor" and "Swift" separately gives us two big lists we need to intersect, which is expensive.
+
+The approach I'd go with is indexing bigrams — pairs of consecutive words. So for "I saw Taylor Swift at the concert", we'd index "I saw", "saw Taylor", "Taylor Swift", "Swift at", and so on. Now when someone searches for "Taylor Swift", we go straight to that bigram entry and get the matching post IDs directly. No intersection needed.
+
+The trade-off is storage. Bigrams are much more unique than individual words, so our index grows significantly — maybe 10x or more. But we can mitigate this by only indexing bigrams that contain at least one meaningful word, filtering out entries that are just stop words like "at the" or "in a".[/SAY]
+[DETAIL]**Problem:** How can we handle multi-keyword, phrase queries?
+
+**Solution:** Great Solution: Bigrams or Shingles
+ApproachWe can improve the read-time efficiency by indexing "bigrams" or "shingles" (in Lucene parlance). The idea is simple: in this sentence:"I saw Taylor Swift at the concert"We can create tokens for each pair of words:"I saw""saw Taylor""Taylor Swift""Swift at""at the""the concert"These can be inserted into our "Likes" and "Creation" indexes. When we want to search for "Taylor Swift", instead of grabbing "Taylor" and "Swift", then intersecting the results, we can go straight to the "Taylor Swift" entry and grab the relevant postIds directly.ChallengesThe biggest problem with this approach is that it dramatically increases the size of our indexes. While the number of bigrams in a sentence is linear with the number of words in the sentence, the bigrams are far more unique. "Swift at" is far less likely to occur in other posts, which makes it sparse. So instead of 10m single-word keywords, we might end up with 100m+ indexed keys.One potential remediation here is to only extract bigram...
+
+**Alternatives considered:**
+- (Good) Good Solution: Intersection and Filter[/DETAIL]
+--- SECTION: Deep Dive: Address the large volume of writes?
+[SAY]The write volume is the other big challenge. When a post is created, we tokenize it and write entries for every keyword — a 100-word post could trigger 100+ index writes. And likes are even worse because popular posts get thousands of likes, and each one needs to update the likes index.
+
+For post ingestion, I'd put a message queue between the Post Service and the Ingestion Service. This decouples them so a spike in post creation doesn't overwhelm the indexer. The Ingestion Service consumes at its own pace.
+
+For likes, the insight is that we don't need to update the index on every single like. Instead, we only write to the likes index when the count crosses certain milestones — powers of 2, say. So we write at 1, 2, 4, 8, 16 likes and so on. A post with 1000 likes only triggers about 10 index writes instead of 1000.
+
+The trade-off is the index becomes slightly stale. But the ordering is approximately correct — the post with 10k likes will always rank above the post with 10. And when we serve results, we fetch 2x what we need, look up fresh like counts from the Like Service, re-sort, and return the top N. So the final results are precise even though the index is approximate.[/SAY]
+[DETAIL]**Problem:** How can we address the large volume of writes?
+
+**Solution:** Great Solution: Two stage architecture.
+ApproachWe can do even better by only updating the like count in our indexes when it passes specific milestones like powers of 2 or 10. So we would write to the index when the post has 1 like, 2 likes, 4 likes, etc. This reduces the number of writes exponentially - we no longer have to make 1000 writes for 1000 likes, we only have to make 10.But this isn't without a tradeoff! This would mean our index isinherently stale- the data cannot be completely trusted. But theorderingisapproximately correct. The post with 10k likes will definitely be in front of the post with 0 or 1 like.If we want to retrieve N posts for a given query, we grab the top N*2 posts from the Like index. For each post in that list, we query theLike Servicefor the up-to-date like count. Then we sort using that fresh like count before returning to the user.In this case our storage is an approximation but our end result is precise - it has the most recent data. This style oftwo-architecture, where we have an approximate...
+
+**Alternatives considered:**
+- (Good) Good Solution: Batch likes before writing to the database[/DETAIL]
+--- SECTION: Deep Dive: Optimize storage of our system?
+[SAY]So we're indexing a massive amount of data, but here's the thing — users only ever care about a tiny fraction of it. Nobody's searching through all 10 million posts that mention "the."
+
+Two things I'd do. First, cap each inverted index at maybe 1k to 10k entries. We don't need every post that contains "Mark" — just the most recent and most popular ones. This cuts storage by orders of magnitude.
+
+Second, most keywords rarely or never get searched. Based on search analytics, we can run a background job to move cold keyword indexes to cheaper blob storage like S3. If someone does search for an obscure term, we take the latency hit to fetch from S3, but that's acceptable since our requirement says old or unpopular posts can take longer.[/SAY]
+[DETAIL]**Problem:** How can we optimize storage of our system?[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For handling read volume, we chose CDN edge caching over a distributed cache alongside the search service — the CDN gives us sub-20ms responses for cache hits and absorbs the most traffic, though we lose the ability to invalidate instantly. For phrase queries, bigrams over intersection — faster reads but significantly more storage. And for write volume, the two-stage approximate index with milestone-based like updates over batching — we traded index precision for a massive reduction in writes, but compensate at read time by fetching fresh counts.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Why |
+| --- | --- | --- | --- |
+| How can we handle the large volume of requests fro | Great Solution: Use a CDN to cache at the edge | Good Solution: Use a distributed cache alongside our search service | Better scalability and reliability |
+| How can we handle multi-keyword, phrase queries? | Great Solution: Bigrams or Shingles | Good Solution: Intersection and Filter | Better scalability and reliability |
+| How can we address the large volume of writes? | Great Solution: Two stage architecture. | Good Solution: Batch likes before writing to the database | Better scalability and reliability |[/DETAIL]
+[/SYSDESIGN]

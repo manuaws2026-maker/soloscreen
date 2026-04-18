@@ -1,0 +1,165 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for Yelp, let me start with the functional requirements.
+
+First, users need to be able to search for businesses by name, location, and category — things like "pizza near me" or "coffee shops in Brooklyn." Second, users should be able to view a business's details and its reviews. And third, users need to be able to leave reviews on businesses.
+
+For non-functional requirements — search needs to be fast, under 500ms latency. We want high availability, and eventual consistency is fine for things like review counts propagating. And we need to scale to 100 million daily active users and 10 million businesses.
+
+Below the line for now: user data privacy and GDPR, fault tolerance, and spam and abuse protection.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Users can search for businesses by name, location, and category
+2. Users can view business details and reviews
+3. Users can leave reviews on businesses
+
+**Non-Functional Requirements:**
+- Low-latency search: < 500ms
+- High availability, eventual consistency acceptable
+- Scale: 100M daily active users, 10M businesses
+
+**Below the Line (Out of Scope):**
+- User data privacy and GDPR compliance
+- Fault tolerance and disaster recovery
+- Spam and abuse protection[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Let me define the core entities. We've got three.
+
+A Business represents a listing on Yelp — name, location with lat/long, category, and an average rating. A User is someone who can search for businesses and leave reviews. And a Review is a rating plus optional text that a user leaves on a business — the core of what makes Yelp valuable.[/SAY]
+[DETAIL]- **Business** : Represents a business or service listed on Yelp. Includes details like name, location, category, and average rating.
+- **User** : Represents a Yelp user who can search for businesses and leave reviews.
+- **Review** : Represents a review left by a user for a business, including rating and optional text.[/DETAIL]
+--- SECTION: API Design
+[SAY]Okay so for the APIs, we have three main endpoints mapping directly to our functional requirements.
+
+First, GET /businesses with query, location, category, and page params for search. This returns a paginated list of businesses. Pagination is important here since search can return thousands of results.
+
+Second, GET /businesses/:businessId for viewing a business. I'd actually split this into two — one for the business details and a separate GET /businesses/:businessId/reviews with pagination for the reviews. Reviews can number in the thousands for popular businesses, so we want to load them separately.
+
+Third, POST /businesses/:businessId/reviews with a rating and optional text to leave a review. The userId comes from the session token, not the request body.[/SAY]
+[DETAIL]The next step in the framework is to define the APIs of the system. This sets up a contract between the client and the server, and it's the first point of reference for the high-level design.
+Your goal is to simply go one-by-one through the core requirements and define the APIs that are necessary to satisfy them. Usually, these map 1:1 to the functional requirements, but there are times when multiple endpoints are needed to satisfy an individual functional requirement.
+To search for businesses, we'll need a GET endpoint that takes in a set of search parameters and returns a list of businesses.
+Whenever you have an endpoint that can return a large set of results, you should consider adding pagination to it. This minimizes the payload size and makes the system more responsive.
+To view a business and its reviews, we'll need a GET endpoint that takes in a business ID and returns the business details and its reviews.
+While this endpoint is enough, you could also split the business and reviews into two separate endpoints. This way we can have pagination on the reviews.
+To leave a review, we'll need a POST endpoint that takes in the business ID, the user ID, the rating, and the optional text, and creates a review.
+
+```
+// Search for businesses
+GET /businesses?query&location&category&page -> Business[]
+```
+
+```
+// View business details and reviews
+GET /businesses/:businessId -> Business & Review[]
+```
+
+```
+// View business details
+GET /businesses/:businessId -> Business
+
+// View reviews for a business
+GET /businesses/:businessId/reviews?page= -> Review[]
+```
+
+```
+// Leave a review
+POST /businesses/:businessId/reviews
+{
+ rating: number,
+ text?: string
+}
+```[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, I'd use PostgreSQL for everything — businesses, users, reviews. We need transactional consistency for review creation, and Postgres gives us good query support for the various search patterns we'll need.
+
+The interesting question is whether Postgres alone can handle our search requirements — geospatial queries for location, full-text search for business names. I'll dig into that in the deep dives, but spoiler: Postgres with extensions can actually handle this just fine at our data size.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through the architecture one requirement at a time.
+
+For search — the client hits our API Gateway, which routes to a Business Service. This service queries our database for businesses matching the search criteria — name, location, category. We'll need good indexing here, but the basic flow is straightforward.
+
+For viewing a business — same path through the API Gateway to the Business Service, which fetches the business record and its reviews from the database.
+
+Now for leaving reviews — I'd introduce a separate Review Service for this. The key insight is that the usage patterns are totally different. Users search and view businesses constantly, but they rarely leave reviews. Separating them lets us scale independently and keeps the write path from competing with the read-heavy search path. The Review Service handles creating the review and also needs to update the business's average rating, which I'll get into in the deep dives.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> LB[Load Balancer]
+    LB --> APIGW[API Gateway]
+    APIGW --> BusinessSvc[Business Service]
+    APIGW --> ReviewSvc[Review Service]
+    BusinessSvc --> Cache[(Redis)]
+    BusinessSvc --> Postgres[(Postgres + PostGIS + pg_trgm)]
+    ReviewSvc --> Postgres
+```
+
+**Data Flows:**
+
+**Search (satisfies Req #1):** Client → Load Balancer → API Gateway → Business Service → Postgres (PostGIS geospatial index + pg_trgm text index) → paginated results back to client.
+
+**View business + reviews (satisfies Req #2):** Client → API Gateway → Business Service (fetches business row) + Review Service (fetches paginated reviews) → merged response.
+
+**Leave review (satisfies Req #3):** Client → API Gateway → Review Service → Postgres (INSERT review + UPDATE business.avg_rating with optimistic locking in one transaction).[/DETAIL]
+--- SECTION: Deep Dive: How would you efficiently calculate and update the averag...
+[SAY]So when users search for businesses, we show the average rating in the results. Calculating that on the fly for every search query by averaging all reviews would be terrible for performance.
+
+Now, one thing to call out — the read-to-write ratio here is massively skewed. Tons of people search and browse, but very few actually leave reviews. At 100 million users, maybe 100,000 reviews per day — that's about 1 write per second. Tiny. So we don't need anything fancy like a message queue.
+
+The approach I'd go with is a synchronous update with optimistic locking. We add a `num_reviews` column to the Business table. When a new review comes in, we calculate the new average as `(old_rating * num_reviews + new_rating) / (num_reviews + 1)`. That's just a few CPU cycles, so it can be done synchronously in the same transaction as the review insert.
+
+The catch is concurrent reviews for the same business — if two reviews hit at the same time, one could overwrite the other's average calculation. So we use optimistic locking with a version column. Each update includes a WHERE clause on the current version. If it doesn't match, we retry. Given the low write volume, conflicts will be extremely rare.[/SAY]
+[DETAIL]**Problem:** How would you efficiently calculate and update the average rating for businesses to ensure it's readily available in search results?
+
+**Solution:** Great Solution: Synchronous Update with Optimistic Locking
+ApproachOur goal with the great solution is to make sure we can update the average rating as we receive new reviews rather than periodically via a cron job. Doing this is relatively straight forward in that we simply need to both add the new review to the Review table while also updating the average rating for the business in the Business table.To make that update efficient, we can introduce a new column,num_reviews, into the Business table. Now, to update an average rating, we simple calculate(old_rating * num_reviews + new_rating) / (num_reviews + 1), which is cheap, just a few CPU cycles so it can be done synchronously for each new review.Synchronous Update with Optimistic LockingChallengesIn doing this, we've actually introduced a new problem. What happens if multiple reviews come in at the same time for the same business? One could overwrite the other, leading to an inconsistent state!Let's imagine a timeline of events:Business A has 100 reviews with an average rating of 4.0User 1...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Naive Approach
+- (Good) Good Solution: Periodic Update with Cron Job[/DETAIL]
+--- SECTION: Deep Dive: How would you modify your system to ensure that a user ca...
+[SAY]We need to enforce that a user can only leave one review per business. This prevents spam — like a competitor leaving dozens of 1-star reviews on a rival.
+
+The right approach is to enforce this at the database level with a unique constraint on user_id and business_id in the reviews table. Something like `ALTER TABLE reviews ADD CONSTRAINT unique_user_business UNIQUE (user_id, business_id)`.
+
+Now it's physically impossible to violate this constraint. If two review submissions race against each other, the database guarantees one wins and the other gets a unique constraint violation that we handle gracefully and return to the client. No application-level checks needed, no race conditions to worry about. The database engine is the most reliable place to enforce data integrity rules.[/SAY]
+[DETAIL]**Problem:** How would you modify your system to ensure that a user can only leave one review per business?
+
+**Solution:** Great Solution: Database Constraint
+ApproachThe right way to handle this is via a database constraint, effectively enforcing the constraint at the database engine level. This can be done via a unique constraint on theuser_idandbusiness_idfields.ALTER TABLE reviews
+ADD CONSTRAINT unique_user_business UNIQUE (user_id, business_id);Now, it's impossible to violate our constraint because the database will throw an error if we try to insert a duplicate. We just need to handle that error gracefully and send it back to the client. In the case of the race condition we mentioned earlier, there will always be one winner (as long as the data is on the same database instance, which it should be). The write attempt that ends up being processed second will throw a unique constraint error.
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Application-level Check[/DETAIL]
+--- SECTION: Deep Dive: Improve search to handle complex queries more efficiently?
+[SAY]This is the crux of the design. Searching by latitude/longitude in a regular database without proper indexing means full table scans — checking every row against geographic bounds. Same problem for text search on business names — a LIKE clause scans the entire table.
+
+The approach I'd go with is Postgres with extensions, and here's why. PostGIS gives us geospatial indexing so we can efficiently find businesses within a radius or bounding box. And pg_trgm gives us trigram-based full-text search for fuzzy matching on business names.
+
+The key thing is our data size actually makes this viable. 10 million businesses at about 1KB each is only 10GB. Even with 100 reviews per business at 1KB each, we're at about 1TB total. Postgres with proper extensions and indexing handles this comfortably without needing to introduce Elasticsearch and all its operational overhead.
+
+If an interviewer pushes for more scale, we'd look at Elasticsearch for the search layer. But for 10 million businesses, Postgres with PostGIS and pg_trgm is the pragmatic choice — one fewer system to operate and no consistency headaches from syncing data between stores.[/SAY]
+[DETAIL]**Problem:** How can you improve search to handle complex queries more efficiently?
+
+**Solution:** Great Solution: Postgres with Extensions
+ApproachOne way we can get around the consistency issue all together is to just use Postgres with the appropriate extensions enabled.Postgres has a geospatial extension calledPostGISthat can be used to index and query geographic data.CREATE EXTENSION IF NOT EXISTS postgis;Postgres also has a full text search extension calledpg_trgmthat can be used to index and query text data.CREATE EXTENSION IF NOT EXISTS pg_trgm;Postgres with ExtensionsBy using these extensions, we can create a geospatial index on the latitude and longitude columns and a full text search index on the business name and description columns without needing to introduce a new service.Given that this is a small amount of data,10M businesses x 1kb each = 10GB+10M businesses x 100 reviews each x 1kb = 1TB, we don't need to worry too much about scaling, something that Elasticsearch excels at, so this is a perfectly reasonable solution.However, it's worth noting that while PostGIS is excellent for geospatial queries, it may n...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Basic Database Indexing[/DETAIL]
+--- SECTION: Deep Dive: How would you modify your system to allow searching by pr...
+[SAY]Right now we search by lat/long coordinates, but users type things like "Pizza in NYC" or "coffee shops in The Mission." They think in terms of neighborhood and city names, not coordinates.
+
+The solution is to add a geocoding layer. When a search comes in with a location name, we first resolve it to coordinates using a geocoding service — either Google's Geocoding API or an internal lookup table for common locations. We'd maintain a table mapping predefined location names — cities, neighborhoods, zip codes — to their bounding box coordinates.
+
+The interesting edge case is neighborhoods, which don't have clean boundaries. "The Mission" in San Francisco isn't a zip code. For these, we'd store polygon boundaries and use PostGIS's ST_Contains to check if a business falls within the polygon. The geocoding lookup adds a small amount of latency, but we can cache the results aggressively since location name to coordinate mappings rarely change.[/SAY]
+[DETAIL]**Problem:** How would you modify your system to allow searching by predefined location names such as cities or neighborhoods?[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For average rating updates, synchronous with optimistic locking over a cron job — we get real-time accuracy without any infrastructure overhead, and the write volume is so low that synchronous processing is totally fine. For the one-review constraint, database-level enforcement over application-level checks — zero chance of race conditions, and the database is the right layer for data integrity. For search, Postgres with PostGIS and pg_trgm over introducing Elasticsearch — one system to operate, no sync issues, and our data size of 10GB of business records is well within what Postgres handles comfortably. If we ever outgrow it, Elasticsearch is the natural next step.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Why |
+| --- | --- | --- | --- |
+| How would you efficiently calculate and update the | Great Solution: Synchronous Update with Optimistic Locking | Good Solution: Periodic Update with Cron Job | Better scalability and reliability |
+| How would you modify your system to ensure that a | Great Solution: Database Constraint | Bad Solution: Application-level Check | Better scalability and reliability |
+| How can you improve search to handle complex queri | Great Solution: Postgres with Extensions | Bad Solution: Basic Database Indexing | Better scalability and reliability |[/DETAIL]
+[/SYSDESIGN]

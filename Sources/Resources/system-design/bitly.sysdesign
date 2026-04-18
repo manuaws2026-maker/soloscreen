@@ -1,0 +1,127 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for a URL shortener like Bitly, let me start with the functional requirements — the core things we need to build.
+
+First, users need to submit a long URL and get back a shortened version. Second, when someone visits that short URL, we redirect them to the original long URL. The short codes must be unique — each one maps to exactly one long URL.
+
+For non-functional requirements — redirects need to be fast, under 100ms. We're prioritizing availability over consistency here, targeting 99.99% uptime. And we need to scale to support 1 billion shortened URLs with 100 million daily active users.
+
+Things I'm putting below the line for now: real-time analytics consistency, spam detection, and malicious URL filtering.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Users can submit a long URL and receive a unique shortened URL
+2. Users can access the original URL via the shortened URL (redirect)
+3. Each short code maps to exactly one long URL (uniqueness guarantee)
+
+**Non-Functional Requirements:**
+- Low-latency redirects: < 100ms
+- High availability: 99.99% uptime (availability over consistency)
+- Scale: 1B shortened URLs, 100M DAU
+- ~1000 new URLs/sec write throughput, ~100K redirects/sec read throughput
+
+**Below the Line (Out of Scope):**
+- Real-time analytics data consistency
+- Spam detection and malicious URL filtering
+- Custom domains, link expiration policies[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Let me define the core entities. We've got three main ones.
+
+A URL Mapping is the central entity — it connects a short code to the original long URL. It includes the short code itself, the original URL, creation timestamp, and an optional expiration date.
+
+A Short URL is what the user receives — basically our domain plus the generated short code. And a User represents whoever created the shortened URL, with their profile and ownership info.[/SAY]
+[DETAIL]- **Original URL** : The original long URL that the user wants to shorten.
+- **Short URL** : The shortened URL that the user receives and can share.
+- **User** : Represents the user who created the shortened URL.[/DETAIL]
+--- SECTION: API Design
+[SAY]Okay so for the API, pretty straightforward — two endpoints.
+
+First, a POST to /urls that takes the long URL and optionally a custom alias and expiration date, and returns the shortened URL. We use POST because we're creating a new mapping in our database.
+
+Second, a GET to /{short_code} which redirects the user to the original long URL. GET is the right verb here because we're reading the existing mapping. We'll return an HTTP 302 redirect so the browser follows it automatically. I'll talk about the choice between 301 and 302 in the high-level design.[/SAY]
+[DETAIL]```
+// Shorten a URL
+POST /urls
+{
+ "long_url": "https://www.example.com/some/very/long/url",
+ "custom_alias": "optional_custom_alias",
+ "expiration_date": "optional_expiration_date"
+}
+->
+{
+ "short_url": "http://short.ly/abc123"
+}
+```
+
+```
+// Redirect to Original URL
+GET /{short_code}
+-> HTTP 302 Redirect to the original long URL
+```[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, I'd use PostgreSQL for our core URL mapping data — we need strong consistency to make sure a short code always maps to exactly one long URL. The main table stores the short code as the primary key, the original URL, creation time, and optional expiration.
+
+Now, for the redirect path, which is read-heavy at 100K requests per second, we'll layer Redis on top as a cache. But I'll get deeper into that in the deep dives.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through the architecture one requirement at a time.
+
+For URL shortening — the client hits a load balancer, which routes to an API Gateway, then to our Core Service. The service generates a unique short code, stores the mapping in our database, and returns the short URL to the user.
+
+For redirection — same entry path through the load balancer and API Gateway. The Core Service first checks the cache for the short code mapping. On a cache hit, it returns the redirect immediately. On a miss, it queries the database, populates the cache, and then returns the redirect. This keeps our hot path extremely fast.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> LB[Load Balancer]
+    LB --> API[API Gateway]
+    API --> Core[Core Service]
+    Core --> Cache[(Cache)]
+    Core --> Database[(Database)]
+```
+
+**Data Flow:**
+1. 1) Users should be able to submit a long URL and receive a shortened version
+2. 2) Users should be able to access the original URL by using the shortened URL[/DETAIL]
+--- SECTION: Deep Dive: Ensure short urls are unique?
+[SAY]So the key challenge here is generating short codes that are guaranteed unique without collisions, and keeping them as short as possible.
+
+The approach I'd go with is a unique counter with base62 encoding. The idea is simple — we maintain a global counter in Redis using the INCR command. Every new URL gets the next counter value, and we encode that integer in base62 to get a compact alphanumeric string.
+
+Redis is perfect for this because it's single-threaded — INCR is atomic, so two simultaneous requests will always get different values. If one gets 1000, the other gets 1001. No collisions, no retries, no database lookups needed.
+
+Each counter value is unique by definition, so we eliminate collision risk entirely. And base62 encoding keeps the codes short — a 7-character base62 code gives us 3.5 trillion possible URLs, way more than we need.[/SAY]
+[DETAIL]**Problem:** How can we ensure short urls are unique?
+
+**Solution:** Great Solution: Unique Counter with Base62 Encoding
+ApproachOne way to guarantee we don't have collisions is to simply increment a counter for each new url. We can then take the output of the counter and encode it using base62 encoding to ensure it's a compacted representation.Redis is particularly well-suited for managing this counter because it's single-threaded and supportsatomicoperations. Being single-threaded means Redis processes one command at a time, eliminating race conditions. ItsINCRcommand atomically increments the counter and returns the new value in a single operation. Because Redis is single-threaded, two simultaneous calls will always receive different values. If one gets 1000, the other gets 1001. This guarantee is what makes Redis ideal for distributed counter management.Each counter value is unique, eliminating the risk of collisions without the need for additional checks. Incrementing a counter and encoding it is computationally efficient, supporting high throughput. With proper counter management, the system can sc...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Long Url Prefix[/DETAIL]
+--- SECTION: Deep Dive: Ensure that redirects are fast?
+[SAY]Alright, so redirects need to be under 100ms. Without optimization, every redirect would hit our database — a full table scan on a billion rows would be way too slow.
+
+The first thing we do is add a database index on the short code column, which gets us from full table scan to O(log N) lookup. That helps, but for the truly hot path at 100K redirects per second, we need more.
+
+The solution I'd go with is CDN and edge computing. We serve the short URL domain through a CDN with points of presence distributed globally. The CDN nodes cache the mappings of short codes to long URLs, so redirect requests get handled close to the user's location.
+
+Even better, by deploying redirect logic to the edge using something like Cloudflare Workers or Lambda@Edge, the redirect happens at the CDN level without ever reaching our origin servers. For popular short codes, the user gets redirected in single-digit milliseconds. The main challenge is cache invalidation across all CDN nodes, but for a URL shortener where mappings rarely change, this is very manageable.[/SAY]
+[DETAIL]**Problem:** How can we ensure that redirects are fast?
+
+**Solution:** Great Solution: Leveraging Content Delivery Networks (CDNs) and Edge Computing
+ApproachAnother thing we can do to reduce latency is to utilize Content Delivery Networks (CDNs) and edge computing. In this approach, the short URL domain is served through a CDN with Points of Presence (PoPs) geographically distributed around the world. The CDN nodes cache the mappings of short codes to long URLs, allowing redirect requests to be handled close to the user's location. Furthermore, by deploying the redirect logic to the edge using platforms like Cloudflare Workers or AWS Lambda@Edge, the redirection can happen directly at the CDN level without reaching the origin server.The benefit here is that, at least for popular short codes, the redirection can happen at the CDN (close to the user) and it never even reaches our Primary Server, meaningfully reducing the latency.ChallengesHowever, this too presents some challenges. Ensuring cache invalidation and consistency across all CDN nodes can be complex. Setting up edge computing requires additional configuration and understan...
+
+**Alternatives considered:**
+- (Good) Good Solution: Add an Index[/DETAIL]
+--- SECTION: Deep Dive: Scale to support 1B shortened urls and 100M DAU?
+[SAY]Right, so let me think about the scale numbers here. Each URL mapping row is roughly 500 bytes when you account for the short code, long URL, metadata, and indexes. At 1 billion rows, that's about 500GB of data — fits on a single well-provisioned Postgres instance, but we'd want to shard for throughput.
+
+On the read side, we've already tackled that with caching and CDN — most redirects never hit the database. On the write side, at roughly 1000 new URLs per second, we can handle this with database sharding by short code hash. Each shard handles a fraction of the writes independently.
+
+The Redis counter for ID generation could become a bottleneck at extreme scale, so we'd use counter ranges — each application server pre-fetches a block of 1000 counter values, uses them locally, and goes back for more when depleted. This eliminates the per-request Redis roundtrip while maintaining uniqueness.[/SAY]
+[DETAIL]**Problem:** How can we scale to support 1B shortened urls and 100M DAU?[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For uniqueness, we chose a Redis counter with base62 encoding over approaches like random generation with collision checking — we traded a single point of dependency on Redis for guaranteed uniqueness with zero retries. For redirect speed, we went with CDN and edge computing over just database indexing — more operational complexity and cost, but we get sub-10ms redirects for popular URLs globally. And for scaling, sharding the database by short code hash gives us horizontal write scalability, but introduces complexity around cross-shard queries if we ever need them.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Why |
+| --- | --- | --- | --- |
+| How can we ensure short urls are unique? | Great Solution: Unique Counter with Base62 Encoding | Bad Solution: Long Url Prefix | Better scalability and reliability |
+| How can we ensure that redirects are fast? | Great Solution: Leveraging Content Delivery Networks (CDNs) and Edge Computing | Good Solution: Add an Index | Better scalability and reliability |[/DETAIL]
+[/SYSDESIGN]

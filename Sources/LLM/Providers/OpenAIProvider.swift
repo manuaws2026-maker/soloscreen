@@ -15,7 +15,20 @@ struct OpenAIProvider: LLMProvider, Sendable {
         let lowered = model.lowercased()
         return lowered.contains("gpt-4o")
             || lowered.contains("gpt-4.1")
+            || lowered.contains("gpt-5")
             || lowered.contains("o4")
+    }
+
+    // MARK: - Reasoning Model Detection
+
+    /// Reasoning models (o-series and GPT-5.x) do not support `temperature`
+    /// and use `max_completion_tokens` instead of `max_tokens`.
+    private func isReasoningModel(_ model: String) -> Bool {
+        let lowered = model.lowercased()
+        return lowered.hasPrefix("o1")
+            || lowered.hasPrefix("o3")
+            || lowered.hasPrefix("o4")
+            || lowered.contains("gpt-5")
     }
 
     // MARK: - Complete (Non-Streaming)
@@ -205,11 +218,16 @@ struct OpenAIProvider: LLMProvider, Sendable {
             apiMessages.append(convertMessage(message, supportsVision: hasVision))
         }
 
+        let reasoning = isReasoningModel(model)
+
         var body = ChatCompletionRequest(
             model: model,
             messages: apiMessages,
-            temperature: options.temperature,
-            maxTokens: options.maxTokens,
+            // Reasoning models reject temperature — omit it.
+            temperature: reasoning ? nil : options.temperature,
+            // Reasoning models use max_completion_tokens, not max_tokens.
+            maxTokens: reasoning ? nil : options.maxTokens,
+            maxCompletionTokens: reasoning ? (options.maxTokens ?? 4096) : nil,
             stream: stream
         )
 
@@ -298,11 +316,14 @@ struct OpenAIProvider: LLMProvider, Sendable {
 // MARK: - OpenAI API Request Types
 
 /// Top-level chat completion request body.
+/// Reasoning models (o-series, GPT-5.x) use `maxCompletionTokens` instead of
+/// `maxTokens` and do not accept `temperature`.
 private struct ChatCompletionRequest: Encodable {
     let model: String
     let messages: [ChatRequestMessage]
-    let temperature: Double
+    let temperature: Double?
     let maxTokens: Int?
+    let maxCompletionTokens: Int?
     let stream: Bool
     var streamOptions: StreamOptions?
 }

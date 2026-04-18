@@ -1,6 +1,6 @@
 import Testing
 import Foundation
-@testable import SubtleAI
+@testable import SoloScreen
 
 @Suite("LLMTypes")
 struct LLMTypesTests {

@@ -6,19 +6,19 @@
 	<string>en</string>
 
 	<key>CFBundleExecutable</key>
-	<string>SubtleAI</string>
+	<string>SoloScreen</string>
 
 	<key>CFBundleIdentifier</key>
-	<string>com.subtleai.app</string>
+	<string>com.soloscreen.app</string>
 
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 
 	<key>CFBundleName</key>
-	<string>SubtleAI</string>
+	<string>SoloScreen</string>
 
 	<key>CFBundleDisplayName</key>
-	<string>SubtleAI</string>
+	<string>SoloScreen</string>
 
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
@@ -36,13 +36,13 @@
 	<true/>
 
 	<key>NSHumanReadableCopyright</key>
-	<string>Copyright 2026 SubtleAI. All rights reserved.</string>
+	<string>Copyright 2026 SoloScreen. All rights reserved.</string>
 
 	<key>NSMicrophoneUsageDescription</key>
-	<string>SubtleAI needs microphone access to transcribe your voice for chat input and live audio transcription.</string>
+	<string>SoloScreen needs microphone access to transcribe your voice for chat input and live audio transcription.</string>
 
 	<key>NSScreenCaptureUsageDescription</key>
-	<string>SubtleAI needs screen recording permission to capture screenshots that you can attach to your chat messages.</string>
+	<string>SoloScreen needs screen recording permission to capture screenshots that you can attach to your chat messages.</string>
 
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>

@@ -11,7 +11,7 @@ struct OnboardingView: View {
     @State private var apiKey: String = ""
     @State private var isKeySaved: Bool = false
 
-    private let accentTeal = Color(hex: "00BCD4")
+    private let accentTeal = Color(hex: "22C55E")
     private let bgColor = Color(hex: "0D1117")
     private let surfaceColor = Color(hex: "161B22")
     private let borderColor = Color(hex: "30363D")
@@ -64,11 +64,21 @@ struct OnboardingView: View {
 
     private var welcomeStep: some View {
         VStack(spacing: 20) {
-            Image(systemName: "eye.slash.fill")
-                .font(.system(size: 56, weight: .thin))
-                .foregroundStyle(accentTeal.opacity(0.7))
+            Group {
+                if let url = Bundle.module.url(forResource: "BrainIcon", withExtension: "png"),
+                   let nsImg = NSImage(contentsOf: url) {
+                    Image(nsImage: nsImg)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                } else {
+                    Image(systemName: "brain.head.profile")
+                        .font(.system(size: 80, weight: .thin))
+                        .foregroundStyle(accentTeal.opacity(0.7))
+                }
+            }
+            .frame(width: 120, height: 120)
 
-            Text("Welcome to SubtleAI")
+            Text("Welcome to SoloScreen")
                 .font(.system(size: 24, weight: .bold))
                 .foregroundStyle(.white.opacity(0.95))
 
@@ -115,7 +125,7 @@ struct OnboardingView: View {
                 .font(.system(size: 22, weight: .bold))
                 .foregroundStyle(.white.opacity(0.95))
 
-            Text("SubtleAI uses your own API key.\nYour key is stored securely in macOS Keychain.")
+            Text("SoloScreen uses your own API key.\nYour key is stored securely on your Mac.")
                 .font(.system(size: 14))
                 .foregroundStyle(.white.opacity(0.5))
                 .multilineTextAlignment(.center)
@@ -123,9 +133,8 @@ struct OnboardingView: View {
 
             VStack(spacing: 12) {
                 HStack(spacing: 8) {
-                    SecureField("Enter your OpenAI API key", text: $apiKey)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 13))
+                    PasteableSecureField(placeholder: "Enter your OpenAI API key", text: $apiKey)
+                        .frame(height: 20)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 10)
                         .background(
@@ -183,7 +192,7 @@ struct OnboardingView: View {
                 .foregroundStyle(.white.opacity(0.95))
 
             VStack(alignment: .leading, spacing: 14) {
-                tipRow(keys: "Cmd+Shift+Space", tip: "Toggle SubtleAI visibility")
+                tipRow(keys: "Cmd+Shift+Space", tip: "Toggle SoloScreen visibility")
                 tipRow(keys: "Cmd+Shift+S", tip: "Capture a screenshot")
                 tipRow(keys: "Cmd+Shift+R", tip: "Record voice input")
                 tipRow(keys: "Cmd+Shift+N", tip: "Start a new chat")
@@ -191,7 +200,7 @@ struct OnboardingView: View {
             }
             .padding(.top, 4)
 
-            Text("SubtleAI is invisible to screen share.\nDrag the overlay to reposition it.")
+            Text("SoloScreen is invisible to screen share.\nDrag the overlay to reposition it.")
                 .font(.system(size: 12))
                 .foregroundStyle(.white.opacity(0.4))
                 .multilineTextAlignment(.center)

@@ -1,6 +1,21 @@
 import AppKit
 import SwiftUI
 
+/// Custom NSPanel subclass that can become key window even when non-activating.
+///
+/// A standard `NSPanel` with `nonactivatingPanel` style won't become key,
+/// which prevents text fields from receiving keyboard input (including Cmd+V paste).
+/// Overriding `canBecomeKey` fixes this while still keeping the panel non-activating
+/// (it won't steal focus from other apps when merely displayed).
+class KeyablePanel: NSPanel {
+    /// Temporarily allow key status for keyboard input focus (⌃⇧I).
+    /// Set to true, call makeFirstResponder, then set back to false.
+    var allowKeyTemporarily = false
+
+    override var canBecomeKey: Bool { !ignoresMouseEvents || allowKeyTemporarily }
+    override var canBecomeMain: Bool { false }
+}
+
 /// Manages the stealth overlay panel that is invisible to screen capture.
 ///
 /// The panel uses `sharingType = .none` so it never appears in screen recordings,
@@ -12,12 +27,37 @@ final class StealthWindowManager {
 
     // MARK: - State
 
-    private var panel: NSPanel?
+    private var panel: KeyablePanel?
+    private var dotPanel: KeyablePanel?
+    private var mainHostingView: NSView?
     private var isVisible: Bool = true
     private var isMinimized: Bool = false
 
     /// The current window reference, if created. Useful for exclusion in screen captures.
     var window: NSWindow? { panel }
+
+    /// Three orthogonal visibility states. Used by the status-bar menu to
+    /// show contextual items.
+    enum PanelState {
+        case visible     // main panel on screen
+        case hidden      // nothing on screen (main panel orderedOut, dot hidden)
+        case minimized   // dot visible, main panel orderedOut
+    }
+
+    var state: PanelState {
+        if isMinimized { return .minimized }
+        return isVisible ? .visible : .hidden
+    }
+
+    /// Fully hide everything — both the main panel and the dot (if any).
+    /// Used from the status-bar menu when minimized state also wants to
+    /// dismiss the floating dot.
+    func hideCompletely() {
+        panel?.orderOut(nil)
+        dotPanel?.orderOut(nil)
+        isVisible = false
+        isMinimized = false
+    }
 
     // MARK: - Setup
 
@@ -25,16 +65,16 @@ final class StealthWindowManager {
     ///
     /// - Parameter contentView: The SwiftUI root view to host in the panel.
     func setupWindow<Content: View>(contentView: Content) {
-        // Define a reasonable default frame (right side of main screen).
+        // Launch position: full-height strip anchored to the right edge.
         let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 400, height: 700)
-        let panelWidth: CGFloat = 380
-        let panelHeight: CGFloat = min(700, screenFrame.height - 40)
-        let panelX = screenFrame.maxX - panelWidth - 20
-        let panelY = screenFrame.midY - panelHeight / 2
+        let panelWidth: CGFloat = 520
+        let panelHeight: CGFloat = screenFrame.height
+        let panelX = screenFrame.maxX - panelWidth
+        let panelY = screenFrame.origin.y  // bottom in Cocoa coords → spans full height
 
         let frame = NSRect(x: panelX, y: panelY, width: panelWidth, height: panelHeight)
 
-        let stealthPanel = NSPanel(
+        let stealthPanel = KeyablePanel(
             contentRect: frame,
             styleMask: [.borderless, .nonactivatingPanel, .resizable],
             backing: .buffered,
@@ -48,9 +88,11 @@ final class StealthWindowManager {
         // Floating level ensures the panel stays above normal windows.
         stealthPanel.level = .floating
 
-        // Non-activating: clicking the panel does not steal focus from other apps.
+        // Non-activating but keyable: clicking a text field makes the panel key
+        // so it receives keyboard input (including Cmd+V paste), without stealing
+        // focus from the frontmost app for non-text interactions.
         stealthPanel.isFloatingPanel = true
-        stealthPanel.becomesKeyOnlyIfNeeded = true
+        stealthPanel.becomesKeyOnlyIfNeeded = false
 
         // Appearance: dark translucent background with rounded corners.
         stealthPanel.isOpaque = false
@@ -68,8 +110,12 @@ final class StealthWindowManager {
         stealthPanel.isMovableByWindowBackground = true
 
         // Allow resizing within reasonable bounds.
-        stealthPanel.minSize = NSSize(width: 300, height: 400)
-        stealthPanel.maxSize = NSSize(width: 600, height: screenFrame.height)
+        // Hard floor on how narrow the window can be dragged — below this
+        // top-bar elements (Chats pill, model pill, Listen Live, trash,
+        // gear) start clipping or wrapping. Keep drawer-mode available by
+        // staying below the sidebar narrow-threshold (560).
+        stealthPanel.minSize = NSSize(width: 500, height: 400)
+        stealthPanel.maxSize = NSSize(width: 1000, height: screenFrame.height)
 
         // Host the SwiftUI view.
         let hostingView = NSHostingView(rootView: contentView)
@@ -80,6 +126,47 @@ final class StealthWindowManager {
         // so the panel's own backgroundColor shows through.
         hostingView.layer?.backgroundColor = .clear
         stealthPanel.contentView = hostingView
+        self.mainHostingView = hostingView
+
+        // Create a dedicated dot panel for the minimized state.
+        let dotSize: CGFloat = 44
+        let dotFrame = NSRect(
+            x: screenFrame.maxX - dotSize - 16,
+            y: screenFrame.minY + 16,
+            width: dotSize,
+            height: dotSize
+        )
+
+        let dotStealthPanel = KeyablePanel(
+            contentRect: dotFrame,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        dotStealthPanel.sharingType = .none
+        dotStealthPanel.level = .floating
+        dotStealthPanel.isFloatingPanel = true
+        dotStealthPanel.isOpaque = false
+        dotStealthPanel.backgroundColor = .clear
+        dotStealthPanel.hasShadow = false
+        dotStealthPanel.collectionBehavior = [
+            .canJoinAllSpaces,
+            .fullScreenAuxiliary,
+            .transient
+        ]
+        dotStealthPanel.isMovableByWindowBackground = true
+
+        let dotView = NSHostingView(rootView: DotView(onTap: { [weak self] in
+            self?.restore()
+        }))
+        dotView.frame = dotStealthPanel.contentView?.bounds ?? dotFrame
+        dotView.autoresizingMask = [.width, .height]
+        dotStealthPanel.contentView = dotView
+        dotStealthPanel.contentView?.wantsLayer = true
+        dotStealthPanel.contentView?.layer?.cornerRadius = dotSize / 2
+        dotStealthPanel.contentView?.layer?.masksToBounds = true
+        dotStealthPanel.orderOut(nil)
+        self.dotPanel = dotStealthPanel
 
         // Make the content view's corners rounded.
         stealthPanel.contentView?.wantsLayer = true
@@ -100,27 +187,58 @@ final class StealthWindowManager {
         guard let panel else { return }
 
         if isVisible {
-            panel.orderOut(nil)
+            if isMinimized {
+                dotPanel?.orderOut(nil)
+            } else {
+                panel.orderOut(nil)
+            }
         } else {
-            panel.orderFrontRegardless()
+            if isMinimized {
+                dotPanel?.orderFrontRegardless()
+            } else {
+                panel.orderFrontRegardless()
+            }
         }
         isVisible.toggle()
-        isMinimized = false
     }
 
-    /// Explicitly show the overlay.
+    /// Explicitly show the overlay (restores from minimized if needed).
     func show() {
-        guard let panel, !isVisible else { return }
-        panel.orderFrontRegardless()
+        guard !isVisible else { return }
+        if isMinimized {
+            restore()
+        } else {
+            panel?.orderFrontRegardless()
+        }
         isVisible = true
-        isMinimized = false
     }
 
     /// Explicitly hide the overlay.
     func hide() {
-        guard let panel, isVisible else { return }
-        panel.orderOut(nil)
+        guard isVisible else { return }
+        if isMinimized {
+            dotPanel?.orderOut(nil)
+        } else {
+            panel?.orderOut(nil)
+        }
         isVisible = false
+    }
+
+    // MARK: - Stealth Control
+
+    /// Enable or disable stealth mode (invisible to screen capture).
+    ///
+    /// When enabled, the panel uses `sharingType = .none` so it never appears
+    /// in screen recordings or screen-sharing sessions.
+    /// When disabled, the panel becomes a normal window visible to screen capture.
+    /// - Parameter enabled: Whether stealth should be active.
+    func setStealth(_ enabled: Bool) {
+        guard let panel else { return }
+        panel.sharingType = enabled ? .none : .readOnly
+        // Sharp corners + shadow when visible (looks like a real warning
+        // frame). Rounded corners when stealthed.
+        panel.contentView?.layer?.cornerRadius = enabled ? 12 : 0
+        panel.hasShadow = !enabled
     }
 
     // MARK: - Extreme Stealth
@@ -157,35 +275,65 @@ final class StealthWindowManager {
 
     // MARK: - Minimize / Restore
 
-    /// Minimize the panel to a tiny sliver at the edge of the screen.
+    /// Minimize the panel to a small dot at the bottom-right corner of the screen.
+    /// Hides the main panel and shows a dedicated dot panel.
     func minimize() {
-        guard let panel, !isMinimized else { return }
+        guard let panel, dotPanel != nil, !isMinimized else { return }
         isMinimized = true
 
-        // Store the current frame so we can restore it later.
         panelFrameBeforeMinimize = panel.frame
 
-        let screenFrame = NSScreen.main?.visibleFrame ?? panel.frame
-        let miniFrame = NSRect(
-            x: screenFrame.maxX - 8,
-            y: screenFrame.midY - 30,
-            width: 8,
-            height: 60
-        )
-        panel.setFrame(miniFrame, display: true, animate: true)
-        panel.alphaValue = 0.3
+        // Fade out main panel, then show the dot panel.
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.2
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            panel.animator().alphaValue = 0
+        }, completionHandler: {
+            MainActor.assumeIsolated { [weak self] in
+                guard let self else { return }
+
+                self.panel?.orderOut(nil)
+
+                self.dotPanel?.alphaValue = 0
+                self.dotPanel?.orderFrontRegardless()
+
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = 0.15
+                    self.dotPanel?.animator().alphaValue = 1.0
+                }
+            }
+        })
     }
 
-    /// Restore the panel from its minimized state.
+    /// Restore the panel from its minimized dot state.
     func restore() {
-        guard let panel, isMinimized else { return }
+        guard let panel, let dotPanel, isMinimized else { return }
         isMinimized = false
 
-        if let savedFrame = panelFrameBeforeMinimize {
-            panel.setFrame(savedFrame, display: true, animate: true)
-        }
-        panel.alphaValue = 1.0
-        panelFrameBeforeMinimize = nil
+        // Fade out the dot panel, then show the main panel.
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.15
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            dotPanel.animator().alphaValue = 0
+        }, completionHandler: {
+            MainActor.assumeIsolated { [weak self] in
+                guard let self else { return }
+
+                self.dotPanel?.orderOut(nil)
+
+                if let savedFrame = self.panelFrameBeforeMinimize {
+                    self.panel?.setFrame(savedFrame, display: true)
+                }
+                self.panel?.alphaValue = 0
+                self.panel?.orderFrontRegardless()
+
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = 0.2
+                    panel.animator().alphaValue = 1.0
+                }
+                self.panelFrameBeforeMinimize = nil
+            }
+        })
     }
 
     /// Toggle between minimized and restored states.
@@ -205,11 +353,64 @@ final class StealthWindowManager {
 
     /// Close the panel and release resources.
     func tearDown() {
+        dotPanel?.orderOut(nil)
+        dotPanel?.close()
+        dotPanel = nil
         panel?.orderOut(nil)
         panel?.close()
         panel = nil
         isVisible = false
         isMinimized = false
         panelFrameBeforeMinimize = nil
+    }
+}
+
+// MARK: - Minimized Dot View
+
+/// Small teal dot shown when the app is minimized. Clicking restores the full window.
+private struct DotView: View {
+    let onTap: () -> Void
+    @State private var isHovered = false
+
+    /// Load the brain icon via NSImage so we work regardless of asset catalog
+    /// semantics. `Image(_:bundle:)` can silently render blank for raw PNG
+    /// resources in an executable target's SwiftPM bundle.
+    private static let brainImage: NSImage? = {
+        if let url = Bundle.module.url(forResource: "BrainIcon", withExtension: "png") {
+            return NSImage(contentsOf: url)
+        }
+        return nil
+    }()
+
+    var body: some View {
+        Button(action: onTap) {
+            ZStack {
+                // Black surface — the green icon reads sharpest on black.
+                Circle()
+                    .fill(Color.black)
+                    .frame(width: 44, height: 44)
+
+                if let img = Self.brainImage {
+                    Image(nsImage: img)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 42, height: 42)
+                } else {
+                    Image(systemName: "brain.head.profile")
+                        .font(.system(size: 26, weight: .medium))
+                        .foregroundStyle(Color(hex: "22C55E"))
+                }
+
+                Circle()
+                    .stroke(Color.green.opacity(0.85), lineWidth: 1.8)
+                    .frame(width: 44, height: 44)
+            }
+            .shadow(color: Color.green.opacity(0.35), radius: 8)
+            .scaleEffect(isHovered ? 1.1 : 1.0)
+            .opacity(isHovered ? 1.0 : 0.92)
+            .animation(.easeOut(duration: 0.2), value: isHovered)
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
     }
 }

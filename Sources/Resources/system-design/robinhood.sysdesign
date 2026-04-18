@@ -1,0 +1,144 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for Robinhood let me start with the functional requirements.
+
+First, users need to see live stock prices updating in real time. Second, they need to be able to place buy and sell orders — both market and limit. Third, they should be able to cancel pending orders and view their order history.
+
+For non-functional requirements — order management needs strong consistency. If someone places a trade, they need to see accurate, up-to-date order status. We're looking at 20 million daily active users averaging about 5 trades per day across thousands of symbols. Price updates and order placement should reflect in under 200ms. And critically, we need to minimize active connections to the external exchange API since those feeds are expensive.
+
+Below the line for now: connecting to multiple exchanges, trading fee calculations, daily trading limits, and bot detection.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Users can view live stock prices with real-time updates
+2. Users can place buy/sell orders (market and limit)
+3. Users can cancel pending orders and view order history
+4. System minimizes active client connections to the external exchange API
+
+**Non-Functional Requirements:**
+- Strong consistency for order management: users always see accurate order status
+- Scale: 20M DAU, ~5 trades/user/day, thousands of symbols
+- Low latency: price updates and order placement reflected in < 200ms
+- Minimize exchange API connections (expensive resource)
+
+**Below the Line (Out of Scope):**
+- Connecting to multiple exchanges for stock trading
+- Trading fee calculations
+- Daily trading limits / behavior enforcement
+- Bot usage protection[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Let me define the core entities. Three main ones here.
+
+A User is anyone with a Robinhood account — their profile, account balance, and portfolio holdings.
+
+A Symbol represents a stock being traded — the ticker, company name, and current price data.
+
+And an Order captures a buy or sell request from a user — the symbol, position direction, price in cents (not dollars, to avoid floating point issues), number of shares, and status tracking through its lifecycle from pending to filled or cancelled.[/SAY]
+[DETAIL]- **User** : A user of the system.
+- **Symbol** : A stock being traded.
+- **Order** : An order for a buy or sell, created by a user.[/DETAIL]
+--- SECTION: API Design
+[SAY]Okay so four key endpoints.
+
+First, GET /symbol/:name to fetch a symbol's details and live price data. Simple read endpoint.
+
+Second, POST /order to create a new trade. The body includes position (buy or sell), symbol, priceInCents, and numShares. Important detail — I'm using priceInCents as an integer rather than a float for price. In financial applications, floating point precision errors can cause real problems, so integers are the way to go.
+
+Third, DELETE /order/:id to cancel an outstanding order.
+
+And fourth, GET /orders to list a user's order history with pagination.
+
+For all of these, the user identity comes from the JWT or session token in the header. Never trust a user ID passed in the request body.[/SAY]
+[DETAIL]The API is the primary interface that users will interact with. It's important to define the API early on, as it will guide your high-level design. We just need to define an endpoint for each of our functional requirements.
+Let's start with an endpoint to get a symbol, which will include details and price data. We might have an endpoint like this:
+To create an order, an endpoint might look like this:
+Note we're usingpriceInCentsinstead ofpriceto avoid floating point precision issues. Especially for financial application it's better to use integers to avoid errors andfinancial scams.
+To cancel an order, the endpoint could be as simple as:
+Finally, to list orders for a user, the request could be:
+With each of these requests, the user information will be passed in the headers (either via session token or JWT). This is a common pattern for APIs and is a good way to ensure that the user is authenticated and authorized to perform the action while preserving security. You should avoid passing user information in the request body, as this can be easily manipulated by the client.
+
+```
+GET /symbol/:name
+Response: Symbol
+```
+
+```
+POST /order
+Request: {
+ position: "buy",
+ symbol: "META",
+ priceInCents: 52210,
+ numShares: 10
+}
+Response: Order
+```
+
+```
+DELETE /order/:id
+Response: {
+ ok: true
+}
+```
+
+```
+GET /orders
+Response: Order[] (paginated)
+```[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, I'd use PostgreSQL for orders and user data since we need strong consistency and ACID transactions — can't have order states getting corrupted. Orders are partitioned by userId so all reads and writes for a given user hit the same shard.
+
+For the live price data, we need something faster. Redis works well for caching current symbol prices, and we'll use it as the backbone of our price distribution system. The exchange feed writes to Redis, and our services read from it.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through the architecture requirement by requirement.
+
+For live prices, the challenge is that we can't have every user polling the exchange directly — those connections are expensive. So we have a Price Ingestion Service that maintains a single connection to the exchange, receives price updates, and publishes them to a cache. Client apps connect to a Symbol Service via server-sent events (SSE) to get real-time price streams.
+
+For order management, the client hits our API Gateway, which routes to an Order Service. The Order Service validates the order, persists it in Postgres, and then dispatches it to the exchange through an Order Dispatch Service. This separation is important because the exchange interaction is async — we need to track order state transitions as the exchange processes and fills orders.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> LB[Load Balancer]
+    LB --> API[API Gateway]
+    API --> ThisDispatch[This Dispatch Service]
+    API --> ProvisionThis[Provision This Service]
+    API --> SideTo[Side To Service]
+    API --> PricesIs[Prices Is Service]
+    API --> AnOrder[An Order Service]
+    ThisDispatch --> Cache[(Cache)]
+    AnOrder --> Database[(Database)]
+```
+
+**Data Flow:**
+1. 1) Users can see live prices of stocks
+2. 2) Users can manage orders for stocks[/DETAIL]
+--- SECTION: Deep Dive: Scale up live price updates?
+[SAY]So the core problem here is routing. We've got millions of users each watching different sets of symbols, and when a price update comes in, we need to push it only to the servers that have connected users who care about that symbol.
+
+I'd use Redis pub/sub for this. The Symbol Service instances subscribe to Redis channels for whatever symbols their connected users are watching. When the Price Ingestion Service gets an update from the exchange, it publishes to the appropriate Redis channel. Only the servers with interested users receive the update, and they push it to their connected clients via SSE.
+
+This scales nicely because each Symbol Service instance only subscribes to the channels it needs. If no connected user cares about a particular stock, that server doesn't get those updates. And we can horizontally scale the Symbol Service instances as user count grows.[/SAY]
+[DETAIL]**Problem:** How can the system scale up live price updates?[/DETAIL]
+--- SECTION: Deep Dive: How does the system track order updates?
+[SAY]Now here's an interesting challenge. When the exchange fills or partially fills an order, we need to update our local order database. But the exchange gives us back a trade with an externalOrderId, and our Order table is partitioned by userId. There's no efficient way to look up an order by externalOrderId when the data is sharded by user.
+
+So I'd add a lightweight key-value store — something like RocksDB — that maps externalOrderId to the (orderId, userId) tuple. The Order Service populates this mapping when it submits an order to the exchange. When the Trade Processor receives an update from the exchange, it looks up the mapping, finds the right userId shard, and updates the order status.
+
+It's a small piece of infrastructure but it solves a real problem — without it we'd have to scatter-query across all user shards to find which order corresponds to a given external trade, which would be way too slow.[/SAY]
+[DETAIL]**Problem:** How does the system track order updates?[/DETAIL]
+--- SECTION: Deep Dive: How does the system manage order consistency?
+[SAY]Order consistency is critical here. We need orders to be stored consistently on our side and also consistently managed on the exchange side. This is fundamentally about fault tolerance.
+
+Our order database is horizontally partitioned Postgres, keyed by userId. So all reads and writes for a given user hit a single node — no distributed transactions needed for the common case.
+
+When an order is created, the workflow is: validate the order, write it to Postgres with a PENDING status, submit it to the exchange, and then update the status based on the exchange response. The tricky part is what happens if we crash between writing to Postgres and submitting to the exchange, or between submitting and recording the response.
+
+I'd use an outbox pattern here. We write the order and an outbox event in the same database transaction. A separate process reads the outbox and submits to the exchange. This guarantees that if the order is in our database, it will eventually be submitted. And on the return path, we use the externalOrderId mapping to reconcile exchange responses with our local state.[/SAY]
+[DETAIL]**Problem:** How does the system manage order consistency?[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For live prices, we chose Redis pub/sub with SSE over having clients poll — more infrastructure to manage, but dramatically reduces exchange API connections and gives us real-time updates. For order tracking, the externalOrderId mapping store adds a component, but it's the only way to efficiently route exchange updates back to the right user shard. And for order consistency, the outbox pattern adds complexity but guarantees we never lose an order between our system and the exchange, which is non-negotiable for a financial application.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Trade-off |
+| --- | --- | --- | --- |
+| Live price distribution | Redis pub/sub + SSE | Client polling exchange | More infra, but minimizes exchange connections and enables real-time |
+| Order update tracking | RocksDB externalOrderId mapping | Scatter-query across shards | Extra store to maintain, but O(1) lookup vs. expensive fan-out |
+| Order consistency | Outbox pattern + reconciliation | Direct submit with retry | More complex workflow, but guarantees no lost orders |[/DETAIL]
+[/SYSDESIGN]

@@ -1,0 +1,140 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for Google Docs, let me start with the functional requirements — the core things we need to build.
+
+First, users need to be able to create new documents. Second, multiple users should be able to edit the same document concurrently — that's the heart of the problem. Third, users need to see each other's changes in real time as they're typing. And fourth, users should see cursor positions and presence of other collaborators.
+
+For non-functional requirements — edits need to propagate with low latency, under 200ms or the experience feels laggy. We need strong consistency on the document state so concurrent edits don't corrupt the content. And we should handle millions of concurrent documents with potentially dozens of editors each.
+
+Below the line for now: permissions and sharing, version history, comments and suggestions, and offline editing.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Users can create new documents
+2. Multiple users can edit the same document concurrently
+3. Users can see each other's changes in real time
+4. Users can see cursor positions and presence of other collaborators
+
+**Non-Functional Requirements:**
+- Low-latency edit propagation: < 200ms for edits to appear on other clients
+- Strong consistency: concurrent edits must not corrupt document state
+- Scale to millions of concurrent documents, dozens of editors per document
+- High availability: 99.9% uptime
+
+**Below the Line (Out of Scope):**
+- Permissions and sharing model
+- Version history and revision tracking
+- Comments, suggestions, and annotation features
+- Offline editing and sync[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Let me define the core entities. We've got four main ones.
+
+An Editor is a user actively editing a document — their profile and session info. A Document is the collection of text being collaboratively edited — it has metadata like title and the actual content.
+
+An Edit represents a single change made to the document — could be an insert, delete, or format change. And a Cursor tracks where each editor's cursor is positioned in the document, which also doubles as presence information since you only have a cursor if you're actively connected.[/SAY]
+[DETAIL]- **Editor** : A user editing a document.
+- **Document** : A collection of text managed by an editor.
+- **Edit** : A change made to the document by an editor.
+- **Cursor** : The position of the editor's cursor in the document (and the presence of that user in a document).[/DETAIL]
+--- SECTION: API Design
+[SAY]Okay so for the APIs, we've got two flavors here — REST for document management and WebSocket messages for the real-time editing experience.
+
+For REST, a POST to /docs with a title to create a new document, which returns a docId.
+
+Now for the editing itself, we need bidirectional real-time communication, so WebSockets make sense. When a client connects to /docs/{docId}, they establish a WebSocket connection. Over that connection we send messages — insert and delete operations for edits, cursor position updates, and we receive update messages that broadcast other editors' changes back to us.
+
+I'm keeping the message schemas intentionally high-level here — the specifics of what fields each operation carries depend on our conflict resolution strategy, which I'll get into in the deep dives.[/SAY]
+[DETAIL]Next, we can move to the APIs we need to satisfy which will very closely track our functional requirements. For this problem, we probably want some REST APIs to manage the document itself. We also know we're going to need lots of bi-directional communication between each editor and the document they're collectively editing. In this case it makes sense to assume we'll need some sort of websocket-based approach for the editor experience, so we'll define a few of the messages that we'll send over the wire.
+Each interviewer may put more of less emphasis on this step. Some interviewers may want to really understand the intricacies of the messages (veering into a low-level design question) while others may be happy to know that you have a few messages defined opaquely and can move on. We'll assume the latter here!
+When your API involves websockets, you'll be talking aboutmessagesyou send over the websocket vs endpoints you hit with HTTP. The notation is completely up to you, but having some way to describe the protocol or message schema is helpful to convey what is going over the wire.
+
+```
+POST /docs
+{
+ title: string
+} -> {
+ docId
+}
+
+WS /docs/{docId}
+ SEND {
+ type: "insert"
+ ....
+ }
+
+ SEND {
+ type: "updateCursor"
+ position: ...
+ }
+
+ SEND {
+ type: "delete"
+ ...
+ }
+
+ RECV {
+ type: "update"
+ ...
+ }
+```[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, I'd use PostgreSQL for the core transactional data — editors, documents, and their metadata — because we need strong consistency and ACID transactions.
+
+For the edit operations themselves, we need something that can handle high-throughput sequential writes. Postgres works here too since edits are append-only and scoped to individual documents. Cursor positions are ephemeral — they only matter while someone is connected — so those live in memory on the Document Service rather than being persisted at all.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through the architecture one requirement at a time.
+
+For document creation, the client hits our API Gateway through a load balancer, which routes to a Document Metadata Service that creates the record in Postgres. Standard CRUD pattern, nothing fancy.
+
+Now for concurrent editing — this is where it gets interesting. When a user opens a document, they establish a WebSocket connection to a Document Service. This service holds the document state in memory and is responsible for receiving edits, applying conflict resolution, and broadcasting the result to all connected editors.
+
+For viewing real-time changes, when one editor sends an edit over their WebSocket, the Document Service processes it, persists the operation, and pushes the update to all other connected editors on that same document through their WebSocket connections.
+
+For cursor positions and presence — this is inherently ephemeral data. The Document Service tracks which editors are connected and their cursor positions in memory. When a cursor moves, it broadcasts to other editors. When a WebSocket disconnects, it removes that editor from the presence list and notifies everyone else. No need to persist any of this.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> LB[Load Balancer]
+    LB --> API[API Gateway]
+    API --> ScaledCrud[Scaled Crud Service]
+    API --> OurDocument[Our Document Service]
+    API --> Document[Document Service]
+    Document --> Database[(Database)]
+    Document --> PostgreSQL[(PostgreSQL)]
+```
+
+**Data Flow:**
+1. 1) Users should be able to create new documents.
+2. 2) Multiple users should be able to edit the same document concurrently.
+3. 3) Users should be able to view each other's changes in real-time.
+4. 4) Users should be able to see the cursor position and presence of other users.[/DETAIL]
+--- SECTION: Deep Dive: Scale to millions of websocket connections?
+[SAY]So the big assumption we made is that all editors on a document connect to the same Document Service instance. That works fine for a single server, but it won't scale to millions of concurrent users and it's a single point of failure.
+
+The challenge is — when I connect to the Document Service, I either need to be on the same server as all other editors of my document, or I need to know where they are so I can relay edits to them. This is similar to the problem in WhatsApp or any real-time messaging system.
+
+The solution is to use consistent hashing to route all connections for a given document to the same Document Service instance. A connection routing layer maps docId to a specific server. If that server goes down, we failover to a replica that can load the document state from the database and resume. For horizontal scaling, as document count grows we add more Document Service instances and rebalance using the consistent hash ring.[/SAY]
+[DETAIL]**Problem:** How do we scale to millions of websocket connections?[/DETAIL]
+--- SECTION: Deep Dive: Keep storage under control?
+[SAY]With billions of documents and every keystroke stored as an operation, storage is going to blow up fast. If each document averages 50KB of operations, we're looking at tens of terabytes. Plus, when a new editor connects they need to replay all those operations to reconstruct the document, which gets slower as the operation log grows.
+
+The key insight is that we don't actually need every individual operation forever — we just need the final document state. So I'd implement periodic compaction.
+
+The best time to compact is when the last editor disconnects. The Document Service already has all the operations in memory at that point, so it can collapse them into a single snapshot, write that to the database under a new version ID, and clean up the old operations. This is essentially an online compaction — no separate batch job needed.
+
+The main risk is that compaction could add CPU load to the Document Service, but since we're doing it when the document is idle, it won't affect active editing latency.[/SAY]
+[DETAIL]**Problem:** How do we keep storage under control?
+
+**Solution:** Great Solution: Online Snapshot/Compact Operations
+ApproachA different approach we can take is to have ourDocument Serviceperiodically snapshot/compact operations. Since theDocument Servicehas exclusive ownership of a document when we're not scaling up the cluster, we can safely compact operations without worrying about coordination/consistency. In fact, a natural time to do this is when the document is idle and has no connections - something the document service will know about immediately. We also already have all of the existing document operations in memory at that time, making our job easier.When the last client disconnects we can then:Take all of the existing operations and offload them to a separate (low CPU nice) process for compaction.Write the resulting operations to the DB under a new documentVersionId.Flip thedocumentVersionIdin theDocument Metadata DB.Online Snapshot/Compact OperationsChallengesMoving compaction into the document service risks increasing latency for document operations (especially at the tail P99), we need...
+
+**Alternatives considered:**
+- (Good) Good Solution: Offline Snapshot/Compact[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For storage management, we chose online compaction over offline batch compaction. Online compaction is simpler — the Document Service already has the data in memory when the last user disconnects, so no separate infrastructure is needed. The trade-off is that compaction runs on the same service that handles editing, which could affect tail latency if a new editor connects during compaction. But since we trigger it on idle documents, that risk is minimal.
+
+The broader architectural trade-off is WebSockets with a stateful Document Service versus a stateless approach. Stateful gives us much better latency and simpler conflict resolution since all edits for a document go through one server, but it makes scaling and failover more complex.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Why |
+| --- | --- | --- | --- |
+| How do we keep storage under control? | Great Solution: Online Snapshot/Compact Operations | Good Solution: Offline Snapshot/Compact | Better scalability and reliability |[/DETAIL]
+[/SYSDESIGN]

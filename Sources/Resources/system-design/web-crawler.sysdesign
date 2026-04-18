@@ -1,0 +1,92 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for a web crawler — let me think about what we actually need to build here.
+
+For the functional requirements, the core things: first, we need to crawl web pages starting from a set of seed URLs and extract text content. Second, we need to discover new URLs on each page and add them to our crawl frontier. That's really the core loop — fetch, extract, discover, repeat.
+
+For non-functional requirements — fault tolerance is big, we need to handle failures gracefully and resume without losing progress. Politeness — we have to respect robots.txt and not hammer any single site. Efficiency — we want to crawl the web in under 5 days. And scalability — we're targeting 10 billion pages, so roughly 23,000 pages per second sustained.
+
+Below the line for now: security protections, cost optimization, and legal compliance.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Crawl web pages starting from seed URLs and extract text content
+2. Discover new URLs on each page and add them to the crawl frontier
+
+**Non-Functional Requirements:**
+- Fault tolerance: handle failures gracefully, resume crawling without losing progress
+- Politeness: respect robots.txt, rate-limit per domain (e.g., 1 request/second/domain)
+- Efficiency: crawl 10B pages in under 5 days (~23,000 pages/sec sustained)
+- Scalability: distribute work across hundreds of crawler nodes
+- Deduplication: avoid re-crawling identical content
+
+**Below the Line (Out of Scope):**
+- Security to protect the system from malicious actors
+- Cost optimization and budget constraints
+- Legal compliance and privacy regulations[/DETAIL]
+--- SECTION: API Design
+[SAY]So for a data processing system like this, the API is really about defining the system's interface — what goes in and what comes out.
+
+The input is a set of seed URLs to kick off the crawl. The output is the extracted text data from web pages. There's no traditional REST API here since this is a batch processing pipeline, not a request-response service.[/SAY]
+[DETAIL]For data processing system design questions like this one, it helps to start by defining the system's interface. This includes clearly outline what data the system receives and what it outputs, establishing a clear boundary of the system's functionality.
+**System Interface**
+**Input** : Seed URLs to start crawling from.
+**Output** : Text data extracted from web pages.[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, we need to track URLs in our frontier queue — their status, priority, and which domain they belong to. We also need to store the crawled content itself. I'd use PostgreSQL for the URL metadata since we need consistency around crawl state, and something like S3 or a distributed filesystem for the actual page content since that's bulk storage.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through the architecture one requirement at a time.
+
+The basic flow starts with seed URLs going into a URL frontier queue. Crawler workers pull URLs from the frontier, fetch the pages, and hand them off to a parser. The parser extracts text content and stores it, and also extracts new URLs that get fed back into the frontier.
+
+Now, the key insight is that this should be a pipeline of stages rather than one monolithic crawler — that way we can scale each stage independently and isolate failures. So we've got the URL frontier, then fetcher workers, then parser workers, then a content store. Each stage communicates through queues.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> LB[Load Balancer]
+    LB --> API[API Gateway]
+    API --> Core[Core Service]
+```
+
+**Data Flow:**[/DETAIL]
+--- SECTION: Deep Dive: Ensure we are fault tolerant and don't lose progress?
+[SAY]So the big concern here is that our crawler is doing a lot — DNS resolution, fetching pages, extracting text, discovering new URLs. If any single step fails, we could lose all the work we've done on that page.
+
+Fetching is by far the most failure-prone step. The internet is messy — servers go down, connections time out, pages are malformed. So we need to break the crawler into pipelined stages with a queue between each one. That way a failure in one stage doesn't wipe out progress from the others, and we can retry just the failed stage.
+
+I'd use SQS with exponential backoff for this. When a fetch fails, the message stays in the queue — SQS's visibility timeout makes it reappear after a delay. We use the ChangeMessageVisibility API to dynamically increase the backoff based on how many times the message has been received. After a configured number of retries, it moves to a dead-letter queue so we don't retry forever. This gives us durability without building our own retry infrastructure.[/SAY]
+[DETAIL]**Problem:** How can we ensure we are fault tolerant and don't lose progress?
+
+**Solution:** Great Solution: SQS with Exponential Backoff
+ApproachSQS doesn't have a built-in exponential backoff setting, but it provides the primitives to build one cleanly. The key mechanism is the visibility timeout: when a consumer receives a message but doesn't delete it, the message becomes visible again after the visibility timeout expires (default 30 seconds, configurable up to 12 hours).To implement exponential backoff, we use theChangeMessageVisibilityAPI to dynamically adjust the timeout based on theApproximateReceiveCountattribute, which tracks how many times a message has been received. For example, after each failed fetch, we calculate the next visibility timeout asand callChangeMessageVisibilityto set it. This keeps the message hidden until we're ready to retry.ChallengesWe don't want to retry indefinitely. After a certain number of failures (configured via the queue's redrive policy usingmaxReceiveCount), the message is automatically moved to a dead-letter queue (DLQ). For our purposes, we'll consider the site offline after 5...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: In Memory Timer
+- (Good) Good Solution: Kafka with Manual Exponential Backoff[/DETAIL]
+--- SECTION: Deep Dive: Ensure politeness and adhere to robots.txt?
+[SAY]Right, so politeness means two things. First, we respect robots.txt — that file tells us which pages we're allowed to crawl and how frequently. Second, we don't overload any single site's servers.
+
+For robots.txt, before we crawl any domain we fetch and cache its robots.txt file. We parse it to know which paths are off-limits and what the crawl-delay is. We can cache these in Redis with a TTL so we re-fetch periodically.
+
+For rate limiting, the key insight is we need per-domain rate limiting, not global. I'd assign URLs to crawler workers by domain, so each worker handles one domain at a time and respects that domain's crawl delay. A simple token bucket per domain works well here — one request per second per domain is a reasonable default unless robots.txt specifies otherwise.[/SAY]
+[DETAIL]**Problem:** How can we ensure politeness and adhere to robots.txt?[/DETAIL]
+--- SECTION: Deep Dive: How to scale to 10B pages and efficiently crawl them in u...
+[SAY]Okay so let's do the math first. 10 billion pages in 5 days is about 23,000 pages per second. One machine can maybe handle 50-100 fetches per second, so we need roughly 250 to 500 crawler machines running in parallel.
+
+But the real efficiency problem is deduplication — we don't want to re-crawl pages we've already seen. A naive approach would be storing every URL in a database and checking before each fetch, but that's way too slow at this scale.
+
+I'd use a Bloom filter for this. It's a probabilistic data structure that tells us definitively if we haven't seen a URL, and with high probability if we have. We accept a small false positive rate — maybe we skip a page we haven't actually crawled — but we never crawl duplicates. Using Redis with the RedisBloom module, we get BF.ADD and BF.EXISTS commands that are blazing fast. For 10 billion URLs with a 1% false positive rate, the Bloom filter only needs about 12 GB of memory. That's very manageable.[/SAY]
+[DETAIL]**Problem:** How to scale to 10B pages and efficiently crawl them in under 5 days?
+
+**Solution:** Great Solution: Bloom Filter
+ApproachAnother possible approach is to use a Bloom filter. A Bloom filter is a probabilistic data structure that allows us to test whether an element is a member of a set. It can tell us definitively if an element is not in the set, but it can only tell us with some probability if an element is in the set. This is perfect for our use case. We can use a Bloom filter to store the hashes of the content of the pages we have already crawled. When we fetch a new URL, we hash the content and check the Bloom filter. If the hash is not in the Bloom filter, we know definitively that we haven't crawled this page before. If the hash is in the Bloom filter, we'veprobablycrawled this page before and can skip it (with a small chance of false positive).From a technology perspective, we can use Redis with the RedisBloom module (part of Redis Stack) to store the Bloom filter. RedisBloom provides native commands likeBF.ADDandBF.EXISTSfor this purpose. If using a Redis service without RedisBloom, you cou...
+
+**Alternatives considered:**
+- Simple approach[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For fault tolerance, we chose SQS with exponential backoff over Kafka — SQS gives us visibility timeouts and dead-letter queues out of the box, less operational overhead than managing Kafka. For deduplication, we went with a Bloom filter over an exact URL store — we traded a small false positive rate for massive memory savings and constant-time lookups at 10 billion scale. And the pipelined architecture adds complexity compared to a monolithic crawler, but it gives us independent scaling and fault isolation per stage.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Why |
+| --- | --- | --- | --- |
+| How can we ensure we are fault tolerant and don't | Great Solution: SQS with Exponential Backoff | Good Solution: Kafka with Manual Exponential Backoff | Better scalability and reliability |
+| How to scale to 10B pages and efficiently crawl th | Great Solution: Bloom Filter | Simple approach | Better scalability and reliability |[/DETAIL]
+[/SYSDESIGN]

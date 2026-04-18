@@ -1,0 +1,185 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for a metrics and monitoring system — let me break down the requirements.
+
+For functional requirements, we need three core things. First, the platform needs to ingest metrics from services at massive scale. Second, users need to query and visualize those metrics on dashboards. Third, users should be able to define alert rules with thresholds and get notified when conditions are breached.
+
+For non-functional requirements — we're talking about ingesting 5 million metrics per second from around 500k servers. Dashboard queries need to come back within seconds, even when spanning days or weeks of data. Alert evaluation should fire within 1 minute of the metric being emitted. And the system must be highly available — if monitoring goes down during an incident, you're flying blind. We can tolerate eventual consistency on dashboards, but alerting needs to be reliable.
+
+Below the line: multi-region replication, strong consistency guarantees, and custom metric types.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Ingest metrics from services (5M metrics/sec from 500k servers)
+2. Users can query and visualize metrics on dashboards
+3. Users can define alert rules with thresholds and receive notifications when breached
+
+**Non-Functional Requirements:**
+- Ingestion throughput: 5M metrics/second from ~500k servers
+- Dashboard query latency: < 5 seconds, even for queries spanning days or weeks
+- Alert latency: < 1 minute from metric emission to alert firing
+- High availability: system must remain operational during infrastructure failures
+- Eventual consistency acceptable for dashboards; reliable evaluation for alerts
+
+**Below the Line (Out of Scope):**
+- Multi-region replication
+- Strong consistency guarantees
+- Custom metric types beyond numeric time-series[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Let me define the core entities. We've got five here.
+
+A Label is a key-value pair attached to a metric for filtering — like host="server-1" or region="us-east".
+
+A Metric is a named measurement with labels and a value at a point in time — something like cpu_usage with host and region labels, value of 0.75.
+
+A Series is the full sequence of timestamp-value pairs for one specific metric and label combination. So cpu_usage for server-1 over time is one series, server-2 is a different series.
+
+An Alert Rule defines a condition that triggers notifications — it combines a metric query, a threshold, and a duration. Like "average CPU in us-east above 90% for 5 minutes."
+
+And a Dashboard is a collection of panels, each showing a query result as a chart or table.[/SAY]
+[DETAIL]- **Label** : A key-value pair attached to a metric that lets you slice and filter. For example, `host="server-1"` or `region="us-east"` .
+- **Metric** : A named measurement with labels and a value at a point in time. Example: `cpu_usage{host="server-1", region="us-east"}` = 0.75.
+- **Series** : The full sequence of (timestamp, value) pairs for one specific metric + label combination. So `cpu_usage{host="server-1"}` over time is one series, and `cpu_usage{host="server-2"}` is a different series.
+- **Alert Rule** : A condition that triggers notifications when violated. It combines a metric query, a threshold, and a duration. For example, "average CPU in us-east above 90% for 5 minutes."
+- **Dashboard** : A collection of panels, each displaying a query result as a chart or table.[/DETAIL]
+--- SECTION: API Design
+[SAY]Okay, three main endpoints. First, POST /metrics/ingest for batched metric ingestion — high volume, so we batch multiple data points per request. I'd note that in production this would use protobufs or a binary format for efficiency, but JSON works for the design discussion.
+
+Second, GET /metrics/query with a query DSL — something modeled after PromQL. You pass a query expression, a time range, and a step interval. This powers the dashboards.
+
+Third, POST /alerts/rules to define alert conditions — the rule name, the query expression, a threshold, a duration like "for 5 minutes," and where to send notifications like Slack or PagerDuty.
+
+The key insight is that alert rules are written rarely but evaluated constantly — so the write path is simple but the evaluation path needs to be optimized.[/SAY]
+[DETAIL]Now that we've got a general idea of the shape of the problem, let's define an API for our system. This will help us structure the rest of our design. If we've done our job well, our design will be a direct implementation of the API.
+I'm going to use JSON for the API because it's easy to write, but given the scale of this particular problem you'd almost definitely be using protobufs or a similar binary format for the wire protocol. I'll note this to the interviewer and most will know exactly what I'm talking about!
+First, we need a way to ingest metrics. This is a high volume operation, typically batched, so we'll use a POST endpoint.
+Next, we need a way to query metrics. This is a read-heavy operation where we'll specify some DSL to describe the data we want to collect. PromQL (Prometheus Query Language) is a great example of a DSL for querying time-series data, so we'll model after this.
+Finally, we need a way to define alert rules. These won't happen very often, our rules aren't changing a lot but they are being evaluated **a ton** .
+Great, let's see if we can implement these.
+
+```
+POST /metrics/ingest
+{
+ "metrics": [
+ { "name": "cpu_usage", "labels": {"host": "server-1"}, "value": 0.75, "timestamp": 1640000000 },
+ ...
+ ]
+}
+```
+
+```
+GET /metrics/query?query=avg(cpu_usage{region="us-east"})&start=A&end=B&step=60 -> { "timestamps": [...], "values": [...] }
+```
+
+```
+POST /alerts/rules
+{
+ "name": "High CPU Alert",
+ "query": "avg(cpu_usage{region='us-east'}) > 0.9",
+ "for": "5m",
+ "notifications": ["slack:#oncall", "pagerduty:team-infra"]
+}
+```[/DETAIL]
+--- SECTION: Data Model
+[SAY]For storage, I'd split this into two layers. Alert rules and dashboard configs go in PostgreSQL — low volume, needs consistency, standard relational stuff.
+
+But the actual metrics data is a completely different beast. At 5 million writes per second, we need a time-series database. Something like InfluxDB, VictoriaMetrics, or a columnar store optimized for time-series workloads. These are built for high-throughput writes and efficient range queries with aggregation.
+
+I'll go deeper on the storage choices in the deep dives, but the key point is we're not trying to force all of this into one database.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through this one requirement at a time.
+
+For metric ingestion, agents on each server POST batched metrics to an Ingestion Service. But at 5 million per second, we can't write directly to the database — we'd overwhelm it. So we put Kafka in between. The Ingestion Service validates and writes to Kafka, and consumers on the other side write to our time-series database at a controlled rate.
+
+For dashboards, a Query Service sits in front of the time-series DB and handles the PromQL-style queries. It reads from storage and returns aggregated results for visualization.
+
+For alerting, users register alert rules via an API that writes them to Postgres. An Alert Evaluator service periodically grabs these rules and fires queries against the time-series database to check conditions. When an alert fires, it publishes to a Notification Service.
+
+Now, the Notification Service is important — we don't have the Alert Evaluator call Slack or PagerDuty directly, because if those APIs are flaky, we'd lose alerts. Instead, alert events go through Kafka to the Notification Service, which handles delivery with retries and deduplication.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Agents([Server Agents]) --> LB[Load Balancer]
+    LB --> IS[Ingestion Service]
+    IS --> Kafka[Kafka]
+    Kafka --> TSW[TSDB Writer]
+    TSW --> TSDB[(Time-Series DB)]
+    Client([Dashboard Client]) --> AG[API Gateway]
+    AG --> QS[Query Service]
+    AG --> ARS[Alert Rule Service]
+    QS --> TSDB
+    ARS --> PG[(PostgreSQL)]
+    AE[Alert Evaluator] --> PG
+    AE --> TSDB
+    AE --> Kafka
+    Kafka --> NS[Notification Service]
+    NS --> External[Slack / PagerDuty]
+```
+
+**Data Flow:**
+1. **Metric ingestion**: Agents → Ingestion Service → Kafka → TSDB Writer → Time-Series DB
+2. **Dashboard queries**: Client → API Gateway → Query Service → Time-Series DB → response
+3. **Alert rule creation**: Client → API Gateway → Alert Rule Service → PostgreSQL
+4. **Alert evaluation**: Alert Evaluator polls rules from PostgreSQL → queries TSDB → emits alert events to Kafka → Notification Service → external channels[/DETAIL]
+--- SECTION: Deep Dive: Serve low-latency dashboard queries over weeks of data?
+[SAY]So the challenge here is that dashboard queries can be brutal. An engineer debugging an incident might ask "show me p99 latency for all API endpoints in us-east over 30 days" — that's potentially billions of data points to scan, filter, and aggregate.
+
+The key insight is that most dashboard queries are looking at overlapping data. Two queries 10 seconds apart are looking at almost identical time ranges — the only difference is the last 10 seconds. That's basically a sliding window problem.
+
+I'd add a Redis caching layer with query splitting. We break a 30-day query into chunks — recent data from the last 2 hours goes directly to the database for freshness, but historical data hits the cache first. We also precompute popular dashboard queries on a schedule and warm the cache with TTLs aligned to our freshness requirements.
+
+The result is sub-100ms latency for most dashboard queries. The database only gets hit for recent data or cache misses, which dramatically reduces load.[/SAY]
+[DETAIL]**Problem:** How do we serve low-latency dashboard queries over weeks of data?
+
+**Solution:** Great Solution: Caching Layer + Query Splitting
+ApproachThe best approach takes advantage of the fact that most queries are covering the same data. Like thesliding windowproblem, queries that are separated by 10s are coveringalmost completely overlapping data. The only difference is the last 10s.To take advantage of this, we add a caching layer (Redis) in front of the time-series database:Query splitting: Break a 30-day query into chunks. Recent data (last 2 hours) queries the database directly for freshness. Historical data queries the cache first.Precomputation: Popular dashboard queries are identified and precomputed on a schedule. Results are cached with TTLs aligned to data freshness requirements.Result caching: Query results are cached with keys based on the query + time range. Subsequent identical queries hit the cache.For dashboards that don't require real-time data (which is most of them), we can serve entirely from cache with sub-100ms latency.Caching Layer + Query SplittingChallengesCache invalidation is tricky. Data back...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Query Raw Data Directly
+- (Good) Good Solution: Pre-Computed Rollups at Multiple Resolutions[/DETAIL]
+--- SECTION: Deep Dive: Reduce alert latency below 1 minute?
+[SAY]Our polling-based Alert Evaluator runs every minute, which works for most alerts. But sometimes the interviewer pushes for faster detection — and there's a real business case for it. Every second of downtime for a critical service costs money.
+
+The bottleneck with polling is we're checking on a schedule, not reacting to data as it arrives. If a threshold is breached one second after the last evaluation, we won't notice for up to 59 more seconds.
+
+The solution is to add Flink as a stream processor. Metrics already flow through Kafka, so we add Flink as a second consumer. For each metric series, Flink maintains a rolling window of values in memory. Alert rules get compiled into Flink operators that continuously evaluate conditions against those windows. When a threshold is violated for the configured duration, Flink emits an alert event immediately.
+
+Now alert latency drops from "up to 60 seconds" to "within seconds of the metric arriving." I'd keep the polling evaluator around for non-critical alerts though — Flink adds operational complexity, so we only use it where the latency requirement justifies it.[/SAY]
+[DETAIL]**Problem:** How do we reduce alert latency below 1 minute?
+
+**Solution:** Great Solution: Stream Processing for Real-Time Alerts
+ApproachAs an alternative, we can use a stream processing framework likeFlinkto evaluate alerts against the live data stream. Since metrics already flow through Kafka, we add Flink as a second consumer:Flink reads metrics from Kafka (same topic our ingestion consumers read from)For each metric series, Flink maintains a windowed state (e.g., a rolling 5-minute buffer of values)Alert rules are compiled into Flink operators that continuously evaluate conditions against those windowsWhen a threshold is violated for the configured duration, Flink emits an alert eventAlert Evaluation with FlinkIn this solution, alert evaluation happens as data arrives, not on a polling schedule. There's no database query at all - Flink evaluates against its in-memory window state. Latency drops from "up to 60 seconds" to "within seconds of the metric arriving." The existing polling-based alert evaluator can still handle non-critical alerts while Flink handles the time-sensitive ones.ChallengesFlink adds oper...
+
+**Alternatives considered:**
+- (Good) Good Solution: Increase Polling Frequency[/DETAIL]
+--- SECTION: Deep Dive: Ensure high availability during spikes and failures?
+[SAY]This one is especially important because if the monitoring system goes down during an incident, you're blind at the worst possible moment. We need to think about two paths separately: can we keep ingesting data during failures, and can we still detect and alert?
+
+For the ingestion path, agents buffer locally on disk and retry if the network or ingestion layer is down. Kafka is replicated across availability zones so a broker loss doesn't drop data. And writes are idempotent, so retries don't create duplicate data points.
+
+For the alerting path, alert evaluation state is checkpointed so a processor crash can resume where it left off. Alert events go to Kafka before any external notification — so even if Slack is down, the alert is persisted. The Notification Service retries delivery and can fail over to a secondary channel.
+
+The key principle is: never let in-flight data disappear. When things break, we degrade freshness, not correctness. Metrics and alerts may arrive late, but they still arrive.[/SAY]
+[DETAIL]**Problem:** How do we ensure high availability during spikes and failures?
+
+**Solution:** Great Solution: End-to-End HA for Both Data and Alerts
+ApproachKeep the design simple, but make every step resumable:Ingestion pathAgents buffer locally and retry if the network or ingestion layer is downKafka is replicated across zones so a broker loss doesn't drop dataWrites areidempotentso retries don't create duplicate pointsAlerting + notification pathAlert evaluation state is checkpointed so a processor crash can resumeAlert events are written to Kafka before any external notificationsAlert Service retries delivery and can fail over to a secondary channelThe essence: never let in-flight data disappear. When things break, we degrade freshness, not correctness. Metrics and alerts may arrive late, but they still arrive.ChallengesThis is a lot of moving parts. You need clear SLOs for each path, and you need meta-monitoring to make sure the monitoring system is healthy. If you might be missing an alert because a query is running long or data is delayed, you probably want a watchdog service which is proactively alerting your clients just i...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Single-Instance Ingestion and Alerting
+- (Good) Good Solution: Redundancy + Durable Buffers[/DETAIL]
+--- SECTION: Deep Dive: Handle cardinality explosion?
+[SAY]This is one of the sneakiest problems in metrics systems and worth talking through. Every unique combination of metric name plus labels creates a new time series. A metric like http_requests with host, region, endpoint, status_code, and method labels across 1,000 hosts, 5 regions, 200 endpoints, 10 status codes, and 5 methods could produce 50 million unique series in theory.
+
+On the write side, each series has overhead — indexes, metadata, in-memory tracking. When series count explodes, write performance tanks and memory spikes. On the read side, queries that touch millions of series become extremely slow.
+
+I'd handle this with a multi-pronged approach. First, enforce cardinality limits per metric at ingestion time — reject or aggregate if a metric exceeds a threshold. Second, use label allow-lists so only approved label combinations are indexed. Third, aggregate high-cardinality labels at write time — instead of tracking every individual pod, roll up to the deployment level. The tradeoff is reduced granularity, but the system stays healthy.[/SAY]
+[DETAIL]**Problem:** How do we handle cardinality explosion?[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For dashboard queries, we chose caching with query splitting over pre-computed rollups — more cache management complexity, but we get flexibility for arbitrary queries instead of being locked into predefined rollup intervals. For alert latency, Flink stream processing over just increasing polling frequency — significantly more infrastructure, but we get true real-time alerting for critical services. For high availability, end-to-end HA across both ingestion and alerting paths — more moving parts and operational burden, but the monitoring system stays up when everything else is breaking, which is exactly when it matters most.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Why |
+| --- | --- | --- | --- |
+| How do we serve low-latency dashboard queries over | Great Solution: Caching Layer + Query Splitting | Good Solution: Pre-Computed Rollups at Multiple Resolutions | Better scalability and reliability |
+| How do we reduce alert latency below 1 minute? | Great Solution: Stream Processing for Real-Time Alerts | Good Solution: Increase Polling Frequency | Better scalability and reliability |
+| How do we ensure high availability during spikes a | Great Solution: End-to-End HA for Both Data and Alerts | Good Solution: Redundancy + Durable Buffers | Better scalability and reliability |[/DETAIL]
+[/SYSDESIGN]

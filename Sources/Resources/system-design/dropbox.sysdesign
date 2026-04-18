@@ -1,0 +1,148 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for Dropbox let me start with the functional requirements — the core things we need to build.
+
+First, users need to upload and download files from any device, supporting sizes up to 50GB. Second, files should automatically sync across all of a user's devices. Third, we need file sharing — users should be able to share files or folders with others via links or direct access.
+
+For non-functional requirements — we're prioritizing availability over consistency here. Uploads and syncs should feel fast, so we want low latency. And the system needs to be highly durable — losing someone's files is unacceptable. We should be able to recover files if they're lost or corrupted.
+
+Things I'm putting below the line for now: per-user storage quotas, file versioning, and virus scanning.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Users can upload and download files from any device (up to 50GB)
+2. Files automatically sync across all of a user's devices
+3. Users can share files/folders with other users
+
+**Non-Functional Requirements:**
+- High availability: prioritize availability over consistency
+- Low latency: uploads, downloads, and syncs should feel fast
+- High durability: file loss is unacceptable, must support recovery
+- Scale: 500M+ registered users, 100M DAU
+
+**Below the Line (Out of Scope):**
+- Per-user storage quotas
+- File versioning and revision history
+- Virus and malware scanning[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Let me define the core entities. We've got three main ones.
+
+A File is the raw data — the actual bytes that users upload, download, and share. FileMetadata is everything about the file except the data itself — name, size, MIME type, who uploaded it, timestamps, and the S3 reference. I'm keeping these separate because the raw file goes to blob storage while metadata goes to a database. And a User represents anyone interacting with the system.[/SAY]
+[DETAIL]- **File** : This is the raw data that users will be uploading, downloading, and sharing.
+- **FileMetadata** : This is the metadata associated with the file. It will include information like the file's name, size, mime type, and the user who uploaded it.
+- **User** : The user of our system.[/DETAIL]
+--- SECTION: API Design
+[SAY]Okay so for the API — four key endpoints.
+
+First, POST /files for uploading. The client sends the file along with its metadata. Now, these APIs will actually evolve as we dig deeper — for large files we'll switch to chunked uploads with pre-signed URLs. So think of these as a starting point.
+
+Second, GET /files/{fileId} for downloading — returns the file and its metadata.
+
+Third, POST /files/{fileId}/share for sharing a file with other users — takes an array of user IDs to grant access.
+
+And fourth, GET /files/changes with a since timestamp parameter — this is how clients poll for sync. It returns a list of change events so the client knows what files were created, updated, or deleted since its last sync. User identity comes from the session token in the headers, not the request body.[/SAY]
+[DETAIL]The API is the primary interface that users will interact with. It's important to define the API early on, as it will guide your high-level design. We just need to define an endpoint for each of our functional requirements.
+Starting with uploading a file, we might have an endpoint like this:
+To download a file, our endpoint can be:
+Be aware that your APIs may change or evolve as you progress. In this case, our upload and download APIs actually evolve significantly as we weigh the trade-offs of various approaches in our high-level design (more on this later). You can proactively communicate this to your interviewer by saying, "I am going to outline some simple APIs, but may come back and improve them as we delve deeper into the design."
+To share a file, we might have an endpoint like this:
+Lastly, we need a way for clients to query for changes to files on the remote server. This way we know which files need to be synced to the local device.
+Each `ChangeEvent` includes the `fileId` , the type of change (created, updated, deleted), and the updated metadata. By passing a `since` timestamp, the client can efficiently fetch only the changes that have occurred since its last sync.
+With each of these requests, the user information will be passed in the headers (either via session token or JWT). This is a common pattern for APIs and is a good way to ensure that the user is authenticated and authorized to perform the action while preserving security. You should avoid passing user information in the request body, as this can be easily manipulated by the client.
+
+```
+POST /files
+Request:
+{
+ File,
+ FileMetadata
+}
+```
+
+```
+GET /files/{fileId} -> File & FileMetadata
+```
+
+```
+POST /files/{fileId}/share
+Request:
+{
+ User[] // The users to share the file with
+}
+```
+
+```
+GET /files/changes?since={timestamp} -> ChangeEvent[]
+```[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, I'd use a database like DynamoDB for file metadata — it's loosely structured, the main query pattern is fetching files by user, and it scales horizontally well. That said, PostgreSQL would work fine here too. The actual file data goes to S3 for blob storage — it's purpose-built for large objects and gives us the durability guarantees we need.
+
+I'm separating metadata from file storage because they have completely different access patterns and scaling needs.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through the architecture one requirement at a time.
+
+For file uploads — the client hits our API Gateway through a load balancer, which routes to a File Service. The service stores the metadata in DynamoDB and the actual file bytes in S3 via blob storage.
+
+For downloads — the File Service fetches metadata from DynamoDB, gets the S3 reference, and serves the file. We'll layer a CDN on top to cache popular files close to users.
+
+For sharing — the File Service updates access permissions in the metadata store so other users can access the file.
+
+For syncing — this is where it gets interesting. Clients periodically poll the changes endpoint, or we use a notification service to push change events. When a file changes on one device, the metadata is updated, and other devices pick up the change and download the new version.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> LB[Load Balancer]
+    LB --> API[API Gateway]
+    API --> TheFile[The File Service]
+    API --> BlobStorage[Blob Storage Service]
+    TheFile --> Cache[(Cache)]
+    BlobStorage --> Database[(Database)]
+    BlobStorage --> DynamoDB[(DynamoDB)]
+```
+
+**Data Flow:**
+1. 1) Users should be able to upload a file from any device
+2. 2) Users should be able to download a file from any device
+3. 3) Users should be able to share a file with other users
+4. 4) Users can automatically sync files across devices[/DETAIL]
+--- SECTION: Deep Dive: Support large files?
+[SAY]So the big challenge with large files — up to 50GB — is two things: users need to see upload progress, and they need resumable uploads. If someone loses their connection at 49GB, they shouldn't have to start over.
+
+The solution is chunked uploads with server-side verification. The client splits the file into chunks, each around 5-10MB, and uploads each chunk directly to S3 using a pre-signed URL. Each chunk gets an ETag from S3 on successful upload.
+
+Here's the key insight — we trust but verify. The client reports progress back to our backend via PATCH requests for real-time progress tracking, but our backend periodically verifies chunk status by calling S3's ListParts API. This way we get immediate feedback for the user while maintaining data integrity.
+
+Once all chunks are verified, S3 assembles them into the complete file using its multipart upload completion API.[/SAY]
+[DETAIL]**Problem:** How can you support large files?
+
+**Solution:** Great Solution: Server-Side Chunk Verification
+ApproachA better approach is to implement server-side verification of chunk uploads using ETags. Since S3 event notifications don't trigger for individual multipart upload parts (only when the complete object is finalized), we need to leverage S3's multipart upload API more directly.Each chunk gets an ETag upon successful upload, which the client can include in the PATCH request to our backend. Our backend can then verify these ETags by calling S3's ListParts API, providing an efficient way to validate multiple chunks at once. This approach balances user experience with data integrity - we accept client updates for real-time progress tracking to provide immediate feedback, but periodically verify chunk status server-side before marking the overall file as "uploaded".In short, we trust but verify.
+
+**Alternatives considered:**
+- (Good) Good Solution: Update based on client PATCH request[/DETAIL]
+--- SECTION: Deep Dive: Make uploads, downloads, and syncing as fast as possible?
+[SAY]Right, so speed is critical here. Let me walk through the optimizations for each direction.
+
+For downloads, we use a CDN to cache files closer to users globally — the file doesn't have to travel as far, reducing latency significantly.
+
+For uploads, chunking doesn't just help with resumability — it helps with speed too. Even though our total bandwidth is fixed, we can upload multiple chunks in parallel to maximize throughput. We also use adaptive chunk sizes based on network conditions.
+
+Now here's a subtle but important point about syncing. If we use fixed-size chunks — say every 5MB — inserting a single byte near the beginning shifts all subsequent chunk boundaries, making every chunk after the edit look different. That kills delta sync. The solution is content-defined chunking using a rolling hash like Rabin fingerprinting. With CDC, chunk boundaries are determined by the file's content, so a small edit only affects the surrounding chunks. Most chunks stay identical. This is actually how Dropbox achieves efficient delta sync in practice.
+
+On top of all this, client-side compression before upload reduces the bytes we need to transfer. The compressed data gets stored as-is in S3, and the client decompresses on download.[/SAY]
+[DETAIL]**Problem:** How can we make uploads, downloads, and syncing as fast as possible?[/DETAIL]
+--- SECTION: Deep Dive: Ensure file security?
+[SAY]So security for a file storage system comes down to two layers.
+
+Encryption in transit — we use HTTPS everywhere to encrypt data moving between the client and our servers. That's table stakes.
+
+Encryption at rest — we enable S3 server-side encryption so files are encrypted when stored. S3 encrypts each file with a unique key and stores the key separately. Even if someone gains access to the raw storage, they can't read the files without the encryption keys. This is a built-in S3 feature and straightforward to enable.
+
+Together these two layers mean files are protected both in motion and at rest.[/SAY]
+[DETAIL]**Problem:** How can you ensure file security?[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For large file support, we chose server-side chunk verification over pure client-reported progress — we added a verification step that increases latency slightly, but gives us data integrity guarantees we can't get from trusting the client alone. For syncing speed, content-defined chunking is more complex to implement than fixed-size chunks, but it makes delta sync actually work in practice. And for the metadata store, DynamoDB gives us horizontal scalability, but we lose the relational query flexibility of PostgreSQL — a reasonable trade-off since our access patterns are primarily key-value lookups.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Why |
+| --- | --- | --- | --- |
+| How can you support large files? | Great Solution: Server-Side Chunk Verification | Good Solution: Update based on client PATCH request | Better scalability and reliability |[/DETAIL]
+[/SYSDESIGN]

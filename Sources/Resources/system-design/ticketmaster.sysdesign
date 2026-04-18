@@ -1,0 +1,160 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for Ticketmaster let me start with the functional requirements.
+
+First, users need to be able to view events — see the details, venue info, and a seat map showing availability. Second, they need to search for events by keyword, artist, location, date, or event type. And third, they need to book tickets to events with no double-booking — two people can't end up with the same seat.
+
+For non-functional requirements — search and viewing should prioritize availability, these paths need to stay up even under peak load. But booking needs to prioritize consistency, absolutely no double-selling. We need to handle massive spikes — think 10 million users hitting one event when Taylor Swift tickets drop. Search should be under 500ms. And the system is very read-heavy, roughly 100:1 read-to-write ratio.
+
+Below the line: GDPR compliance, payment processing details, secure transaction handling, and CI/CD pipelines.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Users can view events with details, venue info, and real-time seat map availability
+2. Users can search for events by keyword, artist, location, date, or event type
+3. Users can book tickets with strong consistency (no double-booking)
+
+**Non-Functional Requirements:**
+- High availability for search and viewing paths (99.99% uptime)
+- Strong consistency for booking (no double-selling of seats)
+- Handle extreme spikes: 10M users for a single popular event
+- Low-latency search: < 500ms
+- Read-heavy: ~100:1 read-to-write ratio
+
+**Below the Line (Out of Scope):**
+- GDPR / user data protection details
+- Fault tolerance implementation details
+- Secure payment transaction processing
+- CI/CD pipelines and deployment[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Let me define the core entities. We've got six here.
+
+An Event stores everything about what's happening — date, description, type, the performer involved. It's the central entity.
+
+A User is anyone interacting with the system. Straightforward.
+
+A Performer represents whoever is performing — could be an artist, a band, a sports team, whatever. Name, description, links to their work.
+
+A Venue is the physical location — address, capacity, and critically, the seat map. The seat map is a data structure defining sections, rows, and seat numbers with coordinates for rendering the interactive UI.
+
+A Ticket is generated for every seat in the venue when an event is created. It has the event ID, seat details, pricing, and status — available, reserved, or sold. The client uses the seat map plus ticket statuses to render the interactive seat selection.
+
+And a Booking records a user's purchase — user ID, list of ticket IDs, total price, and booking status like in-progress or confirmed.[/SAY]
+[DETAIL]- **Event** : This entity stores essential information about an event, including details like the date, description, type, and the performer or team involved. It acts as the central point of information for each unique event.
+- **User** : Represents the individual interacting with the system. Needs no further explanation.
+- **Performer** : Represents the individual or group performing or participating in the event. Key attributes for this entity include the performer's name, a brief description, and potentially links to their work or profiles. (Note: this could be artist, company, collective, or many other types of entities. The choice of "performer" is intending to be general enough to cover all possible groups)
+- **Venue** : Represents the physical location where an event is held. Each venue entity includes details such as address, capacity, and a specific seat map, providing a layout of seating arrangements unique to the venue.
+- **Ticket** : Contains information related to individual tickets for events. This includes attributes such as the associated event ID, seat details (like section, row, and seat number), pricing, and status (available or sold). When a new event is created, a ticket is generated for each seat in the venue based on the venue's seat map. The seat map itself is stored as part of the Venue entity (for example, a JSON structure or related table defining sections, rows, and seat numbers along with their coordinates for rendering). The client uses this seat map data combined with each ticket's status to render the interactive seat selection UI.
+- **Booking** : Records the details of a user's ticket purchase. It typically includes the user ID, a list of ticket IDs being booked, total price, and booking status (such as in-progress or confirmed). This entity is key in managing the transaction aspect of the ticket purchasing process.[/DETAIL]
+--- SECTION: API Design
+[SAY]For the API, let me focus on the endpoints and then talk about how we keep the read path highly available.
+
+We need GET /events/:id to view event details with the seat map. GET /search with query params for keyword, artist, location, date, and type. POST /bookings to initiate a ticket purchase with a list of ticket IDs. And PATCH /bookings/:id to confirm payment and complete the booking.
+
+Now for the availability side — since we're read-heavy at 100:1, I'd put aggressive caching in front of the read paths. Event details, performer info, venue data — this stuff changes rarely, so we cache it in Redis with long TTLs. We use a read-through strategy so cache misses automatically populate from the database. And the Event Service is stateless, so we horizontally scale it behind a load balancer to handle demand spikes.[/SAY]
+[DETAIL]In our non-functional requirements we mentioned that our view and search paths need to be highly available, including during peak traffic scenarios. To accomplish this, we need a combination of load balancing, horizontal scaling, and caching.
+**Great Solution: Caching, Load Balancing, and Horizontal Scaling**
+ApproachCachingPrioritize caching for data with high read rates and low update frequency, such as event details (names, dates, venue information), performer bios, and static venue details like location and capacity. Because this data does not change frequently, we can cache it like crazy to heavily minimize the load of our SQL DB and meet our high availability requirements.Cachekey-value pairs likeeventId:eventObjectto efficiently serve frequently accessed data.Utilize Redis or Memcached as in-memory data stores, leveraging their speed for handling large volumes of read operations. A read-through cache strategy ensures data availability, with cache misses triggering a database read and subsequent cache update.Cache Invalidation and Consistency:Set up database triggers to notify the caching system of data changes, such as updates in event dates or performer lineups, to invalidate relevant cache entries.Implement a Time-to-Live policy for cache entries, ensuring periodic refreshes. These TTLs can be long for static data like venue information and short for frequently updated data like event availability.Load BalancingUse algorithms like Round Robin or Least Connections for even traffic distribution across server instances. Implement load balancing for all horizontally scaled services and databases. You typically don't need to show this in your design, but it's good to mention it.Horizontal ScalingThe Event Service is stateless which allows us to horizontally scale it to meet demand. We can do this by adding more instances of the service and load balancing between them.ChallengesOne of the primary challenges is maintaining consistency between the cache and the database. This is particularly challenging with frequent updates to event details (but we don't expect this)Managing a large number of instances presents complexities. Ensuring smooth deployment and effective rollback procedures adds to the operational challenges.
+Caching[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, PostgreSQL is the right choice for our transactional data — events, venues, performers, tickets, and bookings. We need ACID properties for the booking flow to prevent double-selling.
+
+On top of that, Redis for caching event and venue data to handle the read-heavy workload, and Elasticsearch for the search index which I'll get into during the deep dives.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through the architecture one requirement at a time.
+
+For viewing events, the client hits our API Gateway, which routes to an Event Service. The Event Service checks the Redis cache first — for a cache hit, we return immediately. Cache miss triggers a Postgres read and cache population. This handles our 100:1 read ratio well.
+
+For search, we start simple — a Search Service that queries the database with filters. This has obvious issues with full table scans on LIKE queries, but it's a starting point we'll improve in the deep dives.
+
+For booking, this is where consistency matters. The client selects tickets and hits the Booking Service, which needs to atomically reserve those seats so no one else can grab them. I'd use PostgreSQL with proper isolation levels and row-level locking. We'll also need a reservation mechanism so users have time to complete payment without losing their seats — more on that in the deep dives.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> LB[Load Balancer]
+    LB --> API[API Gateway]
+    API --> EventSvc[Event Service]
+    API --> SearchSvc[Search Service]
+    API --> BookingSvc[Booking Service]
+    EventSvc --> EventDB[(Postgres — events)]
+    SearchSvc --> ES[(Elasticsearch)]
+    BookingSvc --> Locks[(Redis — seat locks, TTL)]
+    BookingSvc --> BookDB[(Postgres — bookings)]
+    BookingSvc --> Payment[External Payment Gateway]
+```
+
+**Data Flows:**
+
+**View event (Req #1):** Client → API Gateway → Event Service → Postgres (event + seats) → response.
+
+**Search events (Req #2):** Client → API Gateway → Search Service → Elasticsearch (full-text + geo + date filters) → return paginated results.
+
+**Book ticket (Req #3):** Client → API Gateway → Booking Service → (a) acquire Redis lock on seat with 5-min TTL → (b) collect payment via external gateway → (c) on success, UPDATE booking in Postgres and release lock → return confirmation. Lock auto-expires if user abandons checkout.[/DETAIL]
+--- SECTION: Deep Dive: Improve the booking experience by reserving tickets?
+[SAY]So right now, if two people are looking at the same seat, whoever completes the payment form faster wins. That's a terrible experience — nobody wants to spend five minutes entering their credit card info only to find out the seat was grabbed by someone else.
+
+The fix is a reservation system with a timer, like you see on airline booking sites. I'd use a distributed lock with TTL in Redis. When a user selects a seat and clicks "checkout," we acquire a Redis lock on that ticket ID with a 5-minute TTL. If someone else tries to grab the same seat, the lock fails and they're told it's temporarily held.
+
+If the user completes payment within the window, we update the ticket status to BOOKED in Postgres and release the lock. If they abandon checkout or the timer expires, the TTL auto-releases the lock and the seat becomes available again. No cron jobs, no manual cleanup.
+
+The reason we use Redis here instead of just Postgres — even though Postgres gives us strong consistency — is that we need temporary reservations with automatic expiration. Postgres doesn't support row-level TTLs natively, so we'd need application-level cleanup logic. Redis gives us automatic key expiration and sub-millisecond lock operations under high concurrency.[/SAY]
+[DETAIL]**Problem:** How do we improve the booking experience by reserving tickets?
+
+**Solution:** Great Solution: Distributed Lock with TTL
+ApproachAnother great solution is to implement adistributed lockwith aTTL(Time To Live) using a distributed system likeRedis.You might wonder, if PostgreSQL already providesstrong consistency, why do we need Redis at all? The key reason is that we need atemporaryreservation that automatically expires. PostgreSQL doesn't natively support row-level TTLs, you'd need application-level expiration logic (the cron approach above). Redis gives us automatic key expiration built in, and since it's in-memory, lock acquisition and release are extremely fast under high concurrency.Here is how it would work:When a user selects a ticket, acquire a lock in Redis using a unique identifier (e.g., ticket ID) with a predefined TTL (Time To Live). This TTL acts as an automatic expiration time for the lock.If the user completes the purchase, the ticket's status in the database is updated to "Booked", and the lock in Redis is manually released by the application code before the TTL expires.If the TTL expires...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Long-Running Database Locks
+- (Good) Good Solution: Status & Expiration Time with Cron[/DETAIL]
+--- SECTION: Deep Dive: How will the system ensure a good user experience during ...
+[SAY]Here's the thing — with a really popular event, the seat map goes stale almost instantly. Users keep clicking seats only to find they're already taken. That's frustrating.
+
+Now, the obvious engineering answer is real-time seat updates via SSE or WebSockets. And that works for moderately popular events. But for a mega-event with 10 million people hitting the same page, maintaining that many persistent connections and broadcasting every seat change is a huge infrastructure burden.
+
+The more pragmatic solution — and I think this is what separates senior thinking from just throwing technology at the problem — is a virtual waiting queue. For extremely popular events, we put users in a queue before they even see the booking page. We establish an SSE connection to show them their position, backed by a Redis sorted set with timestamps for ordering.
+
+We let users through in controlled batches. At any given time, only a manageable number of people are actually on the seat selection page, which means the seat map stays accurate and the system doesn't get overwhelmed. It also sets fair expectations — users know where they stand instead of fighting over constantly-disappearing seats.[/SAY]
+[DETAIL]**Problem:** How will the system ensure a good user experience during high-demand events with millions simultaneously booking tickets?
+
+**Solution:** Great Solution: Virtual Waiting Queue for Extremely Popular Events
+ApproachFor extremely popular events, we can implement an admin-enabled virtual waiting queue system to manage user access during times of exceptionally high demand. Users are placed in this queue before even being able to see the booking page (seat map selection). The queue sits in front of the Booking Service, controlling the flow of users accessing the booking interface, thereby preventing system overload and enhancing the user experience. Here is how it would work at a high level:When a user requests to view the booking page, they are placed in a virtual queue. We establish a persistent connection (SSE orWebSocket) with their client and add them to the queue. The queue itself can be backed by Redis (using a sorted set with timestamps for ordering). SSE is simpler since we only need server-to-client communication for position updates, though WebSocket works if you anticipate bidirectional needs.Periodically or based on certain criteria (like tickets booked), dequeue users from the f...
+
+**Alternatives considered:**
+- (Good) Good Solution: SSE for Real-Time Seat Updates[/DETAIL]
+--- SECTION: Deep Dive: Improve search to ensure we meet our low latency requirem...
+[SAY]Our current search is basically a LIKE query against Postgres, which means full table scans. As the event catalog grows, this gets progressively slower. Not going to hit our 500ms target.
+
+I'd add Elasticsearch as a full-text search engine. Elasticsearch uses inverted indexes — it maps every word to the documents containing it, so lookups are extremely fast. We get fuzzy matching for free, which handles typos in search queries.
+
+To keep Elasticsearch in sync with Postgres, I'd use change data capture — CDC captures inserts, updates, and deletes from Postgres and replicates them to the Elasticsearch index in near-real-time. This way the search index is always fresh without us having to dual-write from the application layer, which would introduce consistency risks.
+
+One nice bonus — Elasticsearch supports complex queries across multiple fields simultaneously, so searching by "Taylor Swift in New York after March" is a single efficient query rather than multiple AND conditions on a relational table.[/SAY]
+[DETAIL]**Problem:** How can you improve search to ensure we meet our low latency requirements?
+
+**Solution:** Great Solution: Use a Full-text Search Engine like Elasticsearch
+ApproachAddElasticsearchor a similarfull-text search engine. Elasticsearch is a powerful search engine that excels in full-text search, complex query execution, and handling high-volume traffic efficiently. At its core, Elasticsearch operates using inverted indexes, a key feature that makes it highly efficient for search operations. Inverted indexes allow Elasticsearch to quickly locate and retrieve data by mapping each unique word to the documents or records it appears in, significantly speeding up search queries.To make sure the data in Elasticsearch is always in sync with the data in our SQL DB, we can use change data capture (CDC) for real-time or near-real-time data synchronization from PostgreSQL to Elasticsearch. This setup captures changes in the PostgreSQL database, such as inserts, updates, and deletes, and replicates them to the Elasticsearch index.We can enable fuzzy search functionality with Elasticsearch, which allows for error tolerance in search queries. This is way we ...
+
+**Alternatives considered:**
+- (Good) Good Solution: Indexing & SQL Query Optimization[/DETAIL]
+--- SECTION: Deep Dive: Speed up frequently repeated search queries and reduce lo...
+[SAY]So even with Elasticsearch, if millions of people are all searching "Taylor Swift" at the same time, we're hammering the search cluster with identical queries. We can do better.
+
+Elasticsearch actually has built-in shard-level caching for filter results and full search responses, which helps a lot. But I'd also layer in CDN-based edge caching for non-personalized search results. If the query "Taylor Swift concerts" returns the same results for everyone, we can cache that response at edge locations globally using something like CloudFront. Users get sub-50ms responses because the data is served from a node physically close to them.
+
+For personalized or location-specific results, we fall back to the Elasticsearch cache. The key is recognizing which queries are cacheable at the edge and which aren't. Popular artist searches are perfect CDN candidates. Location-filtered searches less so, but they still benefit from Elasticsearch's internal caching.[/SAY]
+[DETAIL]**Problem:** How can you speed up frequently repeated search queries and reduce load on our search infrastructure?
+
+**Solution:** Great Solution: Implement Query Result Caching and Edge Caching Techniques
+ApproachConveniently, Elasticsearch has built-in caching capabilities that can be leveraged to store results of frequent queries. This reduces the query processing load on the search engine itself. Elasticsearch maintains query caches at the shard level for filter results, plus a separate shard-level request cache for caching full search responses (particularly useful for aggregation-heavy queries). This can be used for adaptive caching strategies, where the system learns and caches results of the most frequently executed queries over time.We can also utilize CDNs to cache search results geographically closer to the user, reducing latency and improving response times. For example, this could mean integratingAWS CloudFront. Note, this only makes sense if search results are not personalized, meaning that the same search query will return the same results for all users.ChallengesEnsuring consistency between cached data and real-time data requires sophisticated synchronization mechanisms. ...
+
+**Alternatives considered:**
+- (Good) Good Solution: Implement Caching Strategies Using Redis or Memcached[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For ticket reservation, we chose Redis distributed locks with TTL over database-level cron-based expiration — more infrastructure, but automatic cleanup and sub-millisecond lock operations under high concurrency. For the high-demand experience, the virtual waiting queue over real-time seat updates — it's actually less complex to operate and gives users a fairer, more predictable experience. For search, Elasticsearch over SQL optimization — requires maintaining a separate index via CDC, but gives us full-text search, fuzzy matching, and the ability to handle millions of concurrent queries. And for search caching, CDN edge caching on top of Elasticsearch's built-in caches — adds CDN costs but drops latency dramatically for popular queries.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Trade-off |
+| --- | --- | --- | --- |
+| Ticket reservation | Distributed Lock with TTL (Redis) | Status & Expiration with Cron | More infra, but automatic expiry and fast lock operations |
+| High-demand UX | Virtual Waiting Queue | SSE Real-Time Seat Updates | Simpler to operate at scale, fairer user experience |
+| Search | Elasticsearch with CDC | SQL Query Optimization | Separate index to maintain, but full-text search + fuzzy matching |
+| Search caching | CDN Edge + Elasticsearch built-in caching | Redis/Memcached caching layer | CDN costs, but sub-50ms for popular queries globally |[/DETAIL]
+[/SYSDESIGN]

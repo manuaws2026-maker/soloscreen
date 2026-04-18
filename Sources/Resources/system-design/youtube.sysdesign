@@ -1,0 +1,121 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for YouTube let me start with the functional requirements — the core things we need to build.
+
+First, users need to upload videos — and we're talking large files, potentially tens of gigabytes. Second, users need to stream those videos with low latency, even on slow or fluctuating network connections — so adaptive bitrate streaming is essential. Third, the system needs to scale to handle roughly 1 million video uploads per day and 100 million videos watched per day.
+
+For non-functional requirements — we're prioritizing availability over consistency. A brief delay before a newly uploaded video appears in search is fine, but the system should never go down. Streaming needs to feel smooth regardless of the user's bandwidth.
+
+Things I'm putting below the line for now: content moderation, bot detection, recommendations, and monitoring/alerting.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Users can upload videos (supporting files up to tens of GBs)
+2. Users can stream videos with low latency and adaptive bitrate
+3. System scales to ~1M uploads/day and ~100M views/day
+
+**Non-Functional Requirements:**
+- High availability: prioritize availability over consistency
+- Smooth streaming: adaptive bitrate for varying network conditions
+- Low-latency playback start: < 2 seconds to first frame
+- Scale: handle peak concurrent streams in the millions
+
+**Below the Line (Out of Scope):**
+- Content moderation and safety
+- Bot/fake account detection
+- Recommendation engine
+- Monitoring and alerting infrastructure[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Let me define the core entities. We've got three.
+
+A User is anyone on the platform — could be an uploader or a viewer. A Video is the actual video content that gets uploaded and watched. And VideoMetadata is everything about the video except the raw bytes — the uploader, title, description, transcript reference, and critically the URLs to the processed video segments that the player needs for streaming. I'm keeping Video and VideoMetadata separate because the raw bytes go to blob storage while metadata goes to a database.[/SAY]
+[DETAIL]- **User** : A user of the system, either an uploader or viewer.
+- **Video** : A video that is uploaded / watched.
+- **VideoMetadata** : This is metadata associated with the video, such as the uploading user, URL reference to a transcript, etc. We'll go into more detail later about what specifically we'll be storing here.[/DETAIL]
+--- SECTION: API Design
+[SAY]Okay so two main endpoints to start.
+
+First, POST /upload for video uploads. The client sends the video along with its metadata. Now, this will evolve significantly — for large files we'll switch to chunked uploads with pre-signed S3 URLs. But as a starting point, this captures the intent.
+
+Second, GET /videos/{videoId} for streaming. This returns the VideoMetadata, which includes the S3 URLs for the processed video segments. The client player uses those URLs to stream the video directly from S3 or CDN. We're not proxying the actual video bytes through our servers — that would be a terrible bottleneck.
+
+I'll probably come back and refine these as we dig into the high-level design.[/SAY]
+[DETAIL]The API is the primary interface that users will interact with. It's important to define the API early on, as it will guide your high-level design. We just need to define an endpoint for each of our functional requirements.
+Let's start with an endpoint to upload a video. We might have an endpoint like this:
+To stream a video, our endpoint might retrieve the video data to play it on device:
+Be aware that your APIs may change or evolve as you progress. In this case, our upload and stream APIs actually evolve significantly as we weigh the trade-offs of various approaches in our high-level design (more on this later). You can proactively communicate this to your interviewer by saying, "I am going to outline some simple APIs, but may come back and improve them as we delve deeper into the design."
+
+```
+POST /upload
+Request:
+{
+ Video,
+ VideoMetadata
+}
+```
+
+```
+GET /videos/{videoId} -> Video & VideoMetadata
+```[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, I'd use Cassandra for video metadata. With a million uploads per day, we're looking at 365 million records per year. Cassandra handles horizontal partitioning well, and our main query pattern is looking up individual videos by videoId — a perfect fit for Cassandra's partition key model.
+
+The actual video files — both the originals and the processed segments — go to S3. And we'd layer a CDN on top of S3 for serving the video segments to viewers globally.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through the architecture one requirement at a time.
+
+For video uploads — the client hits our API Gateway through a load balancer, which routes to a Video Service. The service stores the metadata in Cassandra and initiates the upload of the raw video to S3. Once the raw video lands in S3, it kicks off a processing pipeline.
+
+For video streaming — the client calls GET /videos/{videoId}, the Video Service returns the metadata including URLs to the processed video segments. The client's video player then fetches segments directly from the CDN. The CDN pulls from S3 on cache misses. Our servers never touch the actual video bytes during playback.
+
+The key architectural insight is separating the upload and processing paths from the streaming path. Uploads and processing are write-heavy and compute-intensive. Streaming is read-heavy and bandwidth-intensive. They have completely different scaling characteristics.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> LB[Load Balancer]
+    LB --> API[API Gateway]
+    API --> VideoProcessing[Video Processing Service]
+    API --> VideoStreaming[Video Streaming Service]
+    API --> Processing[Processing Service]
+    API --> ToSuccessfully[To Successfully Service]
+    ToSuccessfully --> Database[(Database)]
+    ToSuccessfully --> Cassandra[(Cassandra)]
+```
+
+**Data Flow:**
+1. 1) Users can upload videos
+2. 2) Users can watch videos[/DETAIL]
+--- SECTION: Deep Dive: Handle processing a video to support adaptive bitrate str...
+[SAY]So smooth playback is everything for YouTube. To support adaptive bitrate streaming, we need to process every uploaded video into multiple formats and quality levels.
+
+When a video is uploaded, it enters a processing pipeline. The pipeline transcodes the video into multiple codec and container combinations — H.264 in MP4, VP9 in WebM, and so on — each at several quality levels like 360p, 720p, 1080p, and 4K. Then it segments each version into small chunks, typically 2-10 seconds each.
+
+The output is a collection of segment files stored in S3, along with a manifest file — like an HLS playlist or DASH MPD — that tells the client player what segments are available and at what quality levels. The player then adaptively selects segments based on current network conditions, seamlessly switching between quality levels mid-playback.
+
+This pipeline is compute-heavy but embarrassingly parallel — each quality level and each segment can be processed independently. So we run it on a distributed task queue with auto-scaling workers.[/SAY]
+[DETAIL]**Problem:** How can we handle processing a video to support adaptive bitrate streaming?[/DETAIL]
+--- SECTION: Deep Dive: Support resumable uploads?
+[SAY]For large videos — potentially tens of gigabytes — we absolutely need resumable uploads. If someone's uploading a 20GB video and loses connection at 19GB, starting over would be a terrible experience.
+
+The approach is the same chunking pattern from Dropbox. The client divides the video into small chunks, around 5-10MB each, and gives each chunk a fingerprint hash. Each chunk gets uploaded independently to S3 using pre-signed URLs.
+
+If the connection drops, the client asks the server which chunks have been received, and only re-uploads the missing ones. Our backend tracks chunk status and, once all chunks are verified, triggers S3's multipart upload completion to assemble the full video. From there, the video enters the processing pipeline.
+
+The nice thing is this also enables parallel uploads — the client can upload multiple chunks simultaneously to maximize throughput.[/SAY]
+[DETAIL]**Problem:** How do we support resumable uploads?[/DETAIL]
+--- SECTION: Deep Dive: Scale to a large number of videos uploaded / watched a day?
+[SAY]Right, so let me think through how each component scales for 1 million uploads and 100 million views per day.
+
+The Video Service is stateless — it handles HTTP requests for pre-signed URLs and metadata queries. We horizontally scale it behind a load balancer, straightforward.
+
+The processing pipeline scales independently. We auto-scale the number of transcoding workers based on queue depth. A spike in uploads means more workers spin up; during quiet periods, they scale down.
+
+For the streaming side, the CDN does the heavy lifting. Popular videos get cached at edge locations globally, so most views never hit our origin servers. For the long tail of less popular videos, S3 serves as the origin with the CDN caching on first access.
+
+Cassandra handles the metadata at scale — partitioned by videoId, it distributes reads and writes across the cluster evenly. And since our main access pattern is single-video lookups, there's no hot partition problem.[/SAY]
+[DETAIL]**Problem:** How do we scale to a large number of videos uploaded / watched a day?[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For video storage, Cassandra over PostgreSQL — we lose relational query flexibility but gain horizontal scalability for hundreds of millions of records. For video processing, an async pipeline means there's a delay between upload and video availability, but it lets us decouple the upload and processing paths and scale them independently. For streaming, relying heavily on CDN means higher infrastructure cost, but it's the only way to serve 100 million views per day with acceptable latency globally. And for upload resilience, chunked uploads add client-side complexity but make the difference between a usable and unusable experience for large files.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Why |
+| --- | --- | --- | --- |[/DETAIL]
+[/SYSDESIGN]

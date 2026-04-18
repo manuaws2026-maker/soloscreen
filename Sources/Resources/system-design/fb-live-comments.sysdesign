@@ -1,0 +1,138 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for Facebook Live Comments let me start with the functional requirements.
+
+First, viewers need to be able to post comments on a live video. Second, all viewers watching that video should see new comments appearing in near-real-time. And third, when someone joins mid-stream, they should be able to scroll back through earlier comments they missed.
+
+For non-functional requirements — we should prioritize availability over consistency here. Eventual consistency is totally fine for comments. The critical metric is latency: comments should be broadcasted to viewers within 200ms end-to-end under normal network conditions. And we need to scale to millions of concurrent live videos with thousands of comments per second on the most popular streams.
+
+Below the line: content moderation, spam filtering, and authentication/authorization details.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Viewers can post comments on a live video
+2. All viewers of a live video see new comments in near-real-time
+3. Viewers joining mid-stream can scroll back through comment history
+
+**Non-Functional Requirements:**
+- Availability over consistency: eventual consistency is acceptable
+- Low latency: < 200ms end-to-end comment broadcast under typical network conditions
+- Scale: millions of concurrent live videos, thousands of comments/sec on popular streams
+
+**Below the Line (Out of Scope):**
+- Content moderation / spam filtering
+- Authentication/authorization implementation details
+- Comment reactions (likes on comments)[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Three entities here, and one of them isn't even ours.
+
+A User can be either a viewer or a broadcaster. A Live Video is the stream being watched — this is owned by a different team, but we need to integrate with it since comments are scoped to a video. And a Comment is the message a user posts on a live video — it has the user ID, video ID, message text, and a timestamp.[/SAY]
+[DETAIL]- **User** : A user can be a viewer or a broadcaster.
+- **Live Video** : The video that is being broadcasted by a user (this is owned and managed by a different team, but is relevant as we will need to integrate with it).
+- **Comment** : The message posted by a user on a live video.[/DETAIL]
+--- SECTION: API Design
+[SAY]Two endpoints. Pretty simple API surface.
+
+First, POST /comments/:liveVideoId with the message in the body. The userId comes from the JWT or session token in the header, not the request body. Standard security practice.
+
+Second, GET /comments/:liveVideoId with cursor-based pagination — cursor is the last comment ID they received, pageSize controls how many to fetch, and sort is descending so they scroll back through older comments. This handles the "catch up on history" requirement.
+
+The real-time delivery of new comments won't be through the REST API — that'll be a persistent connection I'll discuss in the architecture and deep dives.[/SAY]
+[DETAIL]We'll need a simple POST endpoint to create a comment.
+Note that the userId is not passed in the request body. Instead, it is a part of the request header, either by way of a session token or aJWT. This is a common pattern in modern web applications. The client is responsible for storing the session token or JWT and passing it in the request header. The server then validates the token and extracts the userId from it. This is a more secure approach than passing the userId in the request body because it prevents users from tampering with the request and impersonating other users.
+We also need to be able to fetch past comments for a given live video.
+Pagination will be important for this endpoint. More on that later when we get deeper into the design.
+
+```
+POST /comments/:liveVideoId
+Header: JWT | SessionToken
+{
+ "message": "Cool video!"
+}
+```
+
+```
+GET /comments/:liveVideoId?cursor={last_comment_id}&pageSize=10&sort=desc
+```[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, I'd use something like Cassandra or DynamoDB for the comments table, partitioned by liveVideoId. We're write-heavy during active streams and need high throughput. Comments within a partition are ordered by timestamp, which gives us efficient range queries for the history endpoint.
+
+We don't need strong consistency here — eventual consistency is fine per our requirements — so we can optimize for availability and partition tolerance.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through this requirement by requirement.
+
+For posting comments, the client sends a POST request through the API Gateway to a Comment Service, which persists the comment to the database. Straightforward.
+
+For real-time delivery, this is where it gets interesting. We need all viewers of a video to see new comments as they appear. The simplest approach is polling — the client periodically asks "any new comments since my last fetch?" This works but it's wasteful. Most polls return nothing, and we're paying for the request overhead every time. But it's a reasonable starting point.
+
+For comment history, when a user joins mid-stream, they hit the GET endpoint with pagination to load recent comments and can scroll back for more. This is a standard paginated read from our comments store.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> LB[Load Balancer]
+    LB --> API[API Gateway]
+    API --> CommentManagement[Comment Management Service]
+    CommentManagement --> MySQL[(MySQL)]
+    CommentManagement --> Database[(Database)]
+```
+
+**Data Flow:**
+1. 1) Viewers can post comments on a Live video feed
+2. 2) Viewers can see new comments being posted while they are watching the live video.
+3. 3) Viewers can see comments made before they joined the live feed[/DETAIL]
+--- SECTION: Deep Dive: Ensure comments are broadcasted to viewers in real-time?
+[SAY]So polling isn't going to cut it for a real interview answer. We need a push-based model where the server sends comments to clients as soon as they're created.
+
+There are two options — WebSockets and Server-Sent Events. I'd go with SSE here. The key insight is our read/write pattern is heavily asymmetric. Comments are posted relatively infrequently via standard HTTP POST, but every viewer needs to receive every comment in real-time. SSE is a persistent one-way connection from server to client over standard HTTP — perfect for this pattern.
+
+WebSockets give us bidirectional communication, but we don't need that. The infrequent comment creation works fine as regular HTTP requests. SSE is simpler to implement, works with standard HTTP infrastructure, and doesn't require a separate protocol upgrade.
+
+The challenges with SSE are mostly infrastructure-related — some proxies buffer streaming responses, browsers limit concurrent SSE connections per domain, and the long-lived connections complicate monitoring. But these are all well-understood problems with known solutions.[/SAY]
+[DETAIL]**Problem:** How can we ensure comments are broadcasted to viewers in real-time?
+
+**Solution:** Great Solution: Server Sent Events (SSE)
+ApproachA better approach is to use Server Sent Events (SSE). SSE is a persistent connection that operates over standard HTTP, making it simpler to implement than WebSockets. The server can push data to the client in real-time, while client-to-server communication happens through regular HTTP requests.This is a better solution given our read/write ratio imbalance. The infrequent comment creation can use standard HTTP POST requests, while the frequent reads benefit from SSE's efficient one-way streaming.ChallengesSSE introduces several infrastructure challenges that need careful consideration. Some proxies and load balancers lack support for streaming responses, leading to buffering issues that can be difficult to track down. Browsers also impose limits on concurrent SSE connections per domain, which creates problems for users trying to watch multiple live videos simultaneously. The long-lived nature of SSE connections complicates monitoring and debugging efforts.
+
+**Alternatives considered:**
+- (Good) Good Solution: Websockets[/DETAIL]
+--- SECTION: Deep Dive: How will the system scale to support millions of concurre...
+[SAY]Okay so SSE is our delivery mechanism, but now we need to scale it. Each viewer holds an open connection, and a single server can handle maybe 100K concurrent connections before running into CPU, memory, or file descriptor limits. For millions of concurrent viewers, we obviously need to scale horizontally.
+
+This creates a coordination problem: viewers of the same video are spread across many servers. When a comment comes in, how do we get it to all the right servers?
+
+For normal streams, pub/sub works — we can use Redis pub/sub where each server subscribes to channels for the videos its connected clients are watching. When a comment arrives, it gets published to the channel and only the relevant servers receive it.
+
+But for mega-viral streams — think millions of viewers and thousands of comments per second — even pub/sub starts to break down. Every server subscribed to that channel gets hammered with messages.
+
+For those mega-streams, I'd switch to a CDN-based pull model. We maintain a ring buffer of the latest 100-200 comments per mega-stream. Every second, we snapshot this buffer and push it to the CDN. Clients poll the CDN once per second instead of maintaining SSE connections. The CDN handles the fan-out globally with edge caching. The client smoothly animates incoming comments to simulate a continuous stream, spacing them out over the polling interval. This collapses millions of SSE connections down to CDN cache hits, which is dramatically cheaper and more scalable.[/SAY]
+[DETAIL]**Problem:** How will the system scale to support millions of concurrent viewers?
+
+**Solution:** Great Solution: CDN-Based Delivery with Periodic Snapshots
+ApproachThe most elegant solution for mega-streams is to fundamentally change our delivery model. Instead of pushing comments in real-time over SSE, we switch to a pull-based model using our existing CDN infrastructure.The architecture works like this. On the server side, we maintain a ring buffer of the most recent 100-200 comments for each mega-stream. Every second (or more frequently), we take a snapshot of this buffer and write it to Redis or directly to our CDN origin. The CDN distributes this snapshot globally, caching it at edge locations.On the client side, instead of maintaining an SSE connection, the app polls the CDN every second for the latest snapshot. When a new snapshot arrives, the client doesn't dump all the comments on screen at once (that would look janky). Instead, it smoothly animates the new comments, spacing them out over the polling interval to simulate a continuous stream. The client can even use the timestamps to space comments according to their actual timing...
+
+**Alternatives considered:**
+- (Good) Good Solution: Naive Pub/Sub: Every Server Processes Every Comment
+- (Good) Good Solution: Show a Representative Subset[/DETAIL]
+--- SECTION: Deep Dive: Handle client disconnections and ensure viewers don't mis...
+[SAY]Mobile networks are unreliable. Users walk through tunnels, switch between WiFi and cellular, or background the app. We need to handle these disconnections gracefully so people don't miss comments.
+
+SSE actually has a built-in mechanism for this — the Last-Event-ID header. We tag every comment we send with a unique event ID, which can just be the comment ID. When the browser detects a disconnection and reconnects, it automatically includes the last event ID it received. Our server sees that header and replays all missed comments before resuming normal streaming.
+
+For more control, I'd also have the client track the last comment ID locally in app storage. On reconnection, it can explicitly request catch-up via the REST endpoint: GET /comments/:liveVideoId?since={lastCommentId}&limit=100. This lets us build a nicer UX around reconnection — we can animate missed comments at 2-3x speed, or show a "You missed 47 comments" prompt with a jump-to-live option.
+
+For mobile specifically, when the app detects it's being backgrounded, it can proactively disconnect the SSE and record its position. When the user comes back, it reconnects and catches up. This saves battery and gives us a clean reconnection path instead of relying on TCP timeout detection.[/SAY]
+[DETAIL]**Problem:** How do we handle client disconnections and ensure viewers don't miss comments?
+
+**Solution:** Great Solution: Last-Event-ID with Client-Side Tracking
+ApproachSSE has a built-in mechanism for handling reconnections through theLast-Event-IDheader. Every comment we send includes a unique event ID (the comment ID works well). When the browser detects a disconnection, it automatically reconnects and includes the last event ID it received. On the server side, when we see this header, we replay missed comments before resuming normal streaming.For more control, the client can also track the last comment ID locally (in localStorage for web, or app storage for mobile) and explicitly request catch-up via HTTP:GET /comments/:liveVideoId?since={last_comment_id}&limit=100. This lets us build a better UX around reconnection. Rather than dumping missed comments on screen instantly, the client can animate them smoothly at 2-3x speed, or show "You missed 47 comments" with an option to jump to live.For mobile, we can be smarter about battery life. When the app detects it's about to be backgrounded, it can preemptively disconnect the SSE and record its...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Ignore Disconnections and Hope for the Best[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For real-time delivery, we chose SSE over WebSockets — simpler to implement and operate since we only need server-to-client streaming, but we lose bidirectional communication if we ever need it. For scaling mega-streams, the CDN snapshot approach over pure pub/sub — we trade a small increase in latency (up to 1 second for the polling interval) for massive scalability by turning millions of persistent connections into CDN cache hits. And for disconnection handling, Last-Event-ID with client-side tracking over ignoring disconnections — it adds complexity on both server and client, but it's essential for a usable mobile experience on flaky networks.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Trade-off |
+| --- | --- | --- | --- |
+| Real-time delivery | Server Sent Events (SSE) | WebSockets | Simpler, HTTP-native, but one-way only |
+| Mega-stream scaling | CDN-Based Snapshots | Pub/Sub fan-out | Up to 1s added latency, but collapses millions of connections to CDN hits |
+| Disconnection handling | Last-Event-ID + Client Tracking | Ignore disconnections | More client/server complexity, but essential for mobile UX |[/DETAIL]
+[/SYSDESIGN]

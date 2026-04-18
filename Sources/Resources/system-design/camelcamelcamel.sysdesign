@@ -1,0 +1,161 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for a price tracking system like CamelCamelCamel, let me break down what we need.
+
+For functional requirements, two core things. First, users should be able to view price history for any Amazon product — via a website or a Chrome extension — with charts showing how the price has changed over time. Second, users should be able to subscribe to price drop notifications with a custom threshold, like "notify me when this laptop drops below $800."
+
+For non-functional requirements — we need to track around 500 million Amazon products, so scale is a big factor. Price history queries should come back in under 500ms for a smooth chart experience. Price drop notifications should be delivered within 1 hour of the actual price change. And we're prioritizing availability over consistency — eventual consistency is fine since price data doesn't need to be perfectly synchronized.
+
+Below the line: strong consistency for price data, real-time sub-minute price updates, and product reviews or comparison features.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Users can view price history for Amazon products (via website or Chrome extension)
+2. Users can subscribe to price drop notifications with custom thresholds
+
+**Non-Functional Requirements:**
+- Scale: track ~500M Amazon products
+- Query latency: price history charts in < 500ms
+- Notification delivery: within 1 hour of price change
+- Availability over consistency: eventual consistency acceptable
+- ~1M Chrome extension users as data source
+
+**Below the Line (Out of Scope):**
+- Strong consistency for price data
+- Real-time price updates (sub-minute)
+- Product reviews or comparison features[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Four core entities here. A Product represents an Amazon product we're tracking — its ASIN, current price, name, and metadata for display.
+
+A User is someone using our service — their contact info and notification preferences.
+
+A Subscription links a user to a product they're watching, with a specific price threshold that triggers a notification.
+
+And Price is our time-series data — capturing each price change for a product over time, which is what powers the history charts.[/SAY]
+[DETAIL]- **Product** : Represents an Amazon product we're tracking, including its current price and metadata needed for price history display and notifications
+- **User** : Represents a person using our service, containing their contact information and preferences for receiving price drop notifications
+- **Subscription** : Links users to products they want to monitor, specifying the price threshold that triggers notifications
+- **Price** : Time-series data capturing price changes over time for each product, enabling us to generate historical price charts[/DETAIL]
+--- SECTION: API Design
+[SAY]Two main endpoints. First, GET /products/:productId/price with a period and granularity parameter. Period could be 30 days, 6 months, a year. Granularity lets us return daily averages for long ranges or hourly data for recent timeframes. The product ID goes in the URL path for better caching and REST compliance.
+
+Second, POST /subscriptions with a product ID, price threshold, and notification type. This creates a new price watch. When the product drops below that threshold, the user gets notified.
+
+Simple API, but the interesting engineering challenges are all in the backend — how we get price data at scale and serve it fast.[/SAY]
+[DETAIL]The API is the main way users will interact with our price tracking service, both through our website and the Chrome extension. Let's design endpoints that directly support our two core functional requirements.
+We includeproduct_idin the URL path rather than the request body for better caching andRESTcompliance. Thegranularityparameter allows us to return daily averages for long periods or hourly data for recent timeframes.
+
+```
+// Retrieve historical price data for charts and displays
+GET /products/{product_id}/price?period=30d&granularity=daily -> PriceHistory[]
+```
+
+```
+// Subscribe to price drop notifications with threshold
+POST /subscriptions
+{
+ product_id,
+ price_threshold,
+ notification_type,
+}
+-> 200
+```[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, I'd use PostgreSQL for users, products, and subscriptions — standard relational data that needs consistency for things like subscription management.
+
+For the price history though, we're talking about time-series data across 500 million products. That's a different beast. I'd use a time-series optimized store — I'll dive deeper into this later, but the key point is we need efficient time-range queries with aggregation, not traditional row lookups.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through this one requirement at a time.
+
+For viewing price history, we need two pieces: getting price data from Amazon, and serving it to users. On the collection side, we have a Web Crawler that periodically scrapes Amazon product pages and writes price updates to a queue. A Price Ingestion Service consumes from the queue, validates the data, and writes it to our price history store. On the serving side, a Price History Service handles API requests, queries the store, and returns the data for chart rendering.
+
+For price drop notifications, when a new price is ingested and it's lower than the previous price, we check our subscriptions table. A Notification Service finds all users who have a threshold above the new price and sends them alerts. In the initial version, this can be a simple polling job that runs every hour — we'll optimize it in the deep dives.
+
+The Chrome extension is interesting because it serves double duty — it shows users price history on Amazon pages, but it also reports back price data it sees, which supplements our crawling. I'll dig into that more in the deep dives.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Chrome([Chrome Extension]) --> AG[API Gateway]
+    Web([Website]) --> AG
+    AG --> PHS[Price History Service]
+    AG --> SS[Subscription Service]
+    PHS --> TSDB[(Price History Store)]
+    SS --> PG[(PostgreSQL)]
+    Crawler[Web Crawler] --> MQ[Message Queue]
+    Chrome -->|price reports| MQ
+    MQ --> PIS[Price Ingestion Service]
+    PIS --> TSDB
+    PIS --> Kafka[Kafka]
+    Kafka --> NS[Notification Service]
+    NS --> PG
+    NS --> External[Email / Push]
+```
+
+**Data Flow:**
+1. **Price collection**: Web Crawler + Chrome Extension → Message Queue → Price Ingestion Service → Price History Store
+2. **Price history query**: Client → API Gateway → Price History Service → Price History Store → chart data
+3. **Subscription creation**: Client → API Gateway → Subscription Service → PostgreSQL
+4. **Notification**: Price Ingestion Service detects price drop → Kafka → Notification Service → checks subscriptions → sends alerts[/DETAIL]
+--- SECTION: Deep Dive: Efficiently discover and track 500 million Amazon products?
+[SAY]So up until now we've been hand-waving the web crawler. But tracking 500 million products while respecting Amazon's rate limits is actually one of our biggest challenges. We need to solve two things: discovering products, and keeping prices fresh.
+
+The key insight is our Chrome extension. We have about a million users browsing Amazon with our extension installed. When they visit a product page, the extension automatically captures the product ID and current price and reports it back to us. This gives us real-time price data for the products people actually care about — and it naturally prioritizes popular items.
+
+For products that aren't visited frequently by our extension users, we fall back to a prioritized crawler. Products with active subscriptions get crawled more frequently — maybe every few hours. Products nobody's watching get crawled less often — maybe once a week. New products get discovered through Amazon's category pages and sitemap.
+
+This hybrid approach means we're not trying to crawl all 500 million products at the same rate. The Chrome extension handles the popular long tail, and our crawler budget is spent where it matters most.[/SAY]
+[DETAIL]**Problem:** How do we efficiently discover and track 500 million Amazon products?
+
+**Solution:** Great Solution: Chrome Extension + Selective Crawling
+ApproachRemember that Chrome extension with 1 million users we mentioned earlier? It turns out to be more than just a convenience feature, it's actually our secret weapon for data collection.The most elegant solution leverages our Chrome extension's 1 million users as a distributed data collection network. When users browse Amazon with our extension installed, it automatically captures product IDs, current prices, and page metadata, then reports this information to our backend services. This crowdsourced approach transforms user browsing behavior into our primary data collection mechanism.The extension operates transparently, extracting structured data from Amazon's product pages using DOM parsing and sending updates to our price reporting API. We receive real-time price data for products that users are actively viewing, which naturally prioritizes popular and trending items. This user-generated data covers the products people actually care about without requiring extensive crawler inf...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Naive Web Crawling Approach
+- (Good) Good Solution: Prioritized Crawling Based on User Interest[/DETAIL]
+--- SECTION: Deep Dive: Handle potentially malicious price updates from Chrome ex...
+[SAY]Now here's the catch with crowdsourced data — we can't trust it blindly. If a malicious user reports that the latest iPhone costs $0.01, we'd trigger thousands of false notifications and destroy our credibility.
+
+I'd go with a trust-but-verify approach. We accept extension data immediately so we can notify quickly, but when something looks suspicious we queue up a priority verification crawl. A suspicious signal could be a huge price drop, a report from a user who's been wrong before, or a change on a high-subscriber product.
+
+Our existing crawler infrastructure handles these verification jobs within 1-5 minutes. If the crawler confirms the price, great. If it contradicts the extension data, we can send correction notifications and mark that user's trust score down.
+
+For really popular products, we can require multiple independent users to report the same price change before we fully trust it. The more subscribers a product has, the higher our verification bar. This way we get the speed benefit of crowdsourced data without the risk of mass false notifications.[/SAY]
+[DETAIL]**Problem:** How do we handle potentially malicious price updates from Chrome extension users?
+
+**Solution:** Great Solution: Trust-But-Verify with Priority Verification
+ApproachThe best approach is simple: trust the extension data immediately, but verify it quickly with our crawlers when something looks suspicious.Here's how it could work. When our extension reports a price change, we accept it right away and can send notifications immediately. But if the change seems fishy - like a huge price drop, or it's from a user who's been wrong before, or it's a popular product with lots of subscribers - we automatically queue up a verification crawl job to check Amazon directly within a few minutes.We use our existing crawler infrastructure but give these verification jobs high priority. Instead of waiting hours or days for our regular crawling schedule, suspicious price updates get checked within 1-5 minutes. If our crawler finds out the extension data was wrong, we can send correction notifications and mark that user as less trustworthy.For really important products, we can wait for multiple users to report the same price change before we fully trust it. If...
+
+**Alternatives considered:**
+- (Good) Good Solution: Consensus Based Validation[/DETAIL]
+--- SECTION: Deep Dive: Efficiently process price changes and notify subscribed u...
+[SAY]Our initial cron job approach — scan for changes every 2 hours — doesn't meet our 1-hour notification SLA and creates massive database load at scale.
+
+The fundamental problem is we're asking the wrong question at the wrong time. Instead of "what changed in the last 2 hours?" on a schedule, we should ask "who cares about this change?" the moment it happens.
+
+So I'd make this event-driven. When the Price Ingestion Service writes a new price that's different from the previous one, it publishes a price-change event to Kafka with the product ID, old price, and new price. The Notification Service consumes these events, looks up all subscriptions for that product where the threshold is above the new price, and sends notifications.
+
+This way notifications fire within minutes of a price change, not hours. And we're only doing work when prices actually change — no wasted polling. The Notification Service can batch and deduplicate too, so a user watching 50 products doesn't get 50 separate emails if they all drop at once.[/SAY]
+[DETAIL]**Problem:** How do we efficiently process price changes and notify subscribed users?[/DETAIL]
+--- SECTION: Deep Dive: Serve fast price history queries for chart generation?
+[SAY]Okay so the challenge here is serving price charts fast. A popular product might have price data points every few hours for several years — thousands of records. When a user asks for a 2-year chart, we need to aggregate that into daily or weekly averages and return it under 500ms.
+
+I'd go with TimescaleDB for this. It's a PostgreSQL extension purpose-built for time-series workloads, which is nice because we're already using Postgres for our relational data. TimescaleDB gives us hypertables that automatically partition by time, and we can run queries like "SELECT time_bucket('1 day', timestamp), avg(price) FROM prices WHERE product_id = ? GROUP BY 1" and get results in milliseconds even with billions of price records.
+
+The automatic time-based partitioning and built-in compression mean old data takes up less space while staying queryable. And we don't need complex pre-aggregation cron jobs — TimescaleDB's continuous aggregates handle that natively, maintaining materialized views that update incrementally as new data arrives.
+
+The simplicity here is the win. One database ecosystem, real-time aggregations, no external caching layer needed for most queries.[/SAY]
+[DETAIL]**Problem:** How do we serve fast price history queries for chart generation?
+
+**Solution:** Great Solution: TimescaleDB for Real-Time Price Analytics
+ApproachRather than running these cron jobs, we can useTimescaleDB, a time-series extension for PostgreSQL that's purpose-built for this type of workload. Since we're already using PostgreSQL for our operational data (users, products, subscriptions), TimescaleDB lets us handle price history analytics within the same database ecosystem while getting specialized time-series performance.With TimescaleDB, we can perform real-time aggregations directly without any pre-computation. When a user requests a 6-month price chart, we run a query likeSELECT time_bucket('1 day', timestamp), avg(price) FROM prices WHERE product_id = ? GROUP BY 1and get results in milliseconds even with billions of price records. TimescaleDB's automatic partitioning and compression make these aggregations incredibly fast while maintaining PostgreSQL's familiar interface.This keeps our architecture simple. We don't need complex pre-aggregation jobs or multiple database systems. Users can request any time range or granu...
+
+**Alternatives considered:**
+- (Good) Good Solution: Scheduled Pre-Aggregation with Cron Jobs[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For data collection, we chose the Chrome extension plus selective crawling over pure crawling — we depend on user behavior for coverage of popular products, but we dramatically reduce our crawl budget and get real-time data where it matters most. For data integrity, trust-but-verify over pure consensus — we accept slightly more risk of temporary bad data in exchange for faster notifications, with a safety net of priority verification crawls. And for price history storage, TimescaleDB over manual pre-aggregation — we take on a dependency on a specialized extension, but we get flexible real-time aggregations without maintaining cron jobs and separate materialized tables.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Why |
+| --- | --- | --- | --- |
+| How do we efficiently discover and track 500 milli | Great Solution: Chrome Extension + Selective Crawling | Good Solution: Prioritized Crawling Based on User Interest | Better scalability and reliability |
+| How do we handle potentially malicious price updat | Great Solution: Trust-But-Verify with Priority Verification | Good Solution: Consensus Based Validation | Better scalability and reliability |
+| How do we serve fast price history queries for cha | Great Solution: TimescaleDB for Real-Time Price Analytics | Good Solution: Scheduled Pre-Aggregation with Cron Jobs | Better scalability and reliability |[/DETAIL]
+[/SYSDESIGN]

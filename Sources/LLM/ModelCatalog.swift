@@ -35,12 +35,34 @@ enum ModelCatalog {
 
     static let openai: [ModelInfo] = [
         ModelInfo(
+            id: "gpt-5.4",
+            name: "GPT-5.4",
+            provider: "openai",
+            description: "OpenAI's frontier model for complex reasoning, coding, and professional work.",
+            strengths: ["Strongest reasoning", "Excellent code generation", "1M context", "Vision support"],
+            weaknesses: ["Premium pricing", "Higher latency on complex prompts"],
+            supportsVision: true,
+            contextWindow: 1_050_000,
+            costTier: .premium
+        ),
+        ModelInfo(
+            id: "gpt-5.4-mini",
+            name: "GPT-5.4 Mini",
+            provider: "openai",
+            description: "Fast, efficient GPT-5.4 variant for high-volume workloads. 400K context window.",
+            strengths: ["Very fast", "Low cost", "400K context", "Vision support", "Strong coding"],
+            weaknesses: ["Less capable than full 5.4 on complex tasks"],
+            supportsVision: true,
+            contextWindow: 400_000,
+            costTier: .low
+        ),
+        ModelInfo(
             id: "gpt-4o",
             name: "GPT-4o",
             provider: "openai",
-            description: "OpenAI's flagship multimodal model. Excellent at reasoning, coding, and vision tasks.",
-            strengths: ["Strong reasoning", "Excellent code generation", "Fast responses", "Vision support", "Great instruction following"],
-            weaknesses: ["Higher cost than mini models", "Can be verbose on simple tasks"],
+            description: "Previous-gen flagship model. Still excellent at reasoning, coding, and vision tasks.",
+            strengths: ["Strong reasoning", "Fast responses", "Vision support", "Well-tested"],
+            weaknesses: ["Surpassed by GPT-5.4", "128K context limit"],
             supportsVision: true,
             contextWindow: 128_000,
             costTier: .high
@@ -51,32 +73,10 @@ enum ModelCatalog {
             provider: "openai",
             description: "Fast, affordable model ideal for everyday tasks. Best balance of speed, cost, and capability.",
             strengths: ["Very fast", "Low cost", "Good for most tasks", "Vision support", "128K context"],
-            weaknesses: ["Less capable at complex multi-step reasoning", "Weaker at nuanced code refactoring"],
+            weaknesses: ["Less capable at complex multi-step reasoning"],
             supportsVision: true,
             contextWindow: 128_000,
             costTier: .low
-        ),
-        ModelInfo(
-            id: "gpt-4.1",
-            name: "GPT-4.1",
-            provider: "openai",
-            description: "Latest GPT model optimized for coding and long-context tasks. 1M token context window.",
-            strengths: ["Best coding performance", "1M token context", "Excellent instruction following", "Vision support"],
-            weaknesses: ["Higher latency on complex prompts", "Premium pricing"],
-            supportsVision: true,
-            contextWindow: 1_000_000,
-            costTier: .premium
-        ),
-        ModelInfo(
-            id: "gpt-4.1-mini",
-            name: "GPT-4.1 Mini",
-            provider: "openai",
-            description: "Compact version of GPT-4.1 with strong coding abilities at lower cost.",
-            strengths: ["Good coding ability", "1M token context", "Fast", "Vision support", "Affordable"],
-            weaknesses: ["Less capable than full 4.1 on complex tasks"],
-            supportsVision: true,
-            contextWindow: 1_000_000,
-            costTier: .medium
         ),
         ModelInfo(
             id: "o4-mini",
@@ -84,64 +84,75 @@ enum ModelCatalog {
             provider: "openai",
             description: "Reasoning model that thinks step-by-step. Best for math, logic, and complex problem solving.",
             strengths: ["Superior reasoning", "Math and logic", "Step-by-step thinking", "Self-correction"],
-            weaknesses: ["Slower (thinks before responding)", "Higher cost per token", "Not ideal for simple tasks"],
+            weaknesses: ["Slower (thinks before responding)", "Higher cost per token"],
             supportsVision: true,
             contextWindow: 200_000,
             costTier: .high
         ),
     ]
 
-    // MARK: - Anthropic Models (future)
+    // MARK: - Anthropic Models
 
     static let anthropic: [ModelInfo] = [
         ModelInfo(
-            id: "claude-sonnet-4-20250514",
-            name: "Claude Sonnet 4",
+            id: "claude-opus-4-6",
+            name: "Claude Opus 4.6",
             provider: "anthropic",
-            description: "Anthropic's balanced model. Excellent at writing, analysis, and careful reasoning.",
-            strengths: ["Thoughtful responses", "Excellent writing quality", "Strong at analysis", "Good at following nuance"],
-            weaknesses: ["Slower than GPT-4o-mini", "Higher cost"],
+            description: "Anthropic's most capable model. 1M context, agentic coding, advanced reasoning.",
+            strengths: ["Strongest reasoning", "1M context", "Best coding", "Sustained agentic tasks"],
+            weaknesses: ["Premium pricing", "Higher latency"],
             supportsVision: true,
-            contextWindow: 200_000,
+            contextWindow: 1_000_000,
+            costTier: .premium
+        ),
+        ModelInfo(
+            id: "claude-sonnet-4-6",
+            name: "Claude Sonnet 4.6",
+            provider: "anthropic",
+            description: "Balanced performance model. Excellent at writing, coding, and analysis with 1M context.",
+            strengths: ["Excellent writing", "Strong coding", "1M context", "Good value"],
+            weaknesses: ["Slower than Haiku"],
+            supportsVision: true,
+            contextWindow: 1_000_000,
             costTier: .high
         ),
         ModelInfo(
-            id: "claude-haiku-4-20250414",
-            name: "Claude Haiku 4",
+            id: "claude-haiku-4-5-20251001",
+            name: "Claude Haiku 4.5",
             provider: "anthropic",
             description: "Fast and affordable Claude model for everyday tasks.",
             strengths: ["Very fast", "Low cost", "Good writing", "Vision support"],
-            weaknesses: ["Less capable at complex reasoning", "Smaller context"],
+            weaknesses: ["Less capable at complex reasoning"],
             supportsVision: true,
             contextWindow: 200_000,
             costTier: .low
         ),
     ]
 
-    // MARK: - Google Models (future)
+    // MARK: - Google Models
 
     static let google: [ModelInfo] = [
-        ModelInfo(
-            id: "gemini-2.5-flash",
-            name: "Gemini 2.5 Flash",
-            provider: "google",
-            description: "Google's fast multimodal model with thinking capabilities.",
-            strengths: ["Very fast", "Strong multimodal", "Good reasoning", "Low cost"],
-            weaknesses: ["Less consistent than GPT-4o on edge cases"],
-            supportsVision: true,
-            contextWindow: 1_000_000,
-            costTier: .low
-        ),
         ModelInfo(
             id: "gemini-2.5-pro",
             name: "Gemini 2.5 Pro",
             provider: "google",
-            description: "Google's most capable model with advanced reasoning and 1M context.",
+            description: "Google's flagship thinking model with advanced reasoning and 1M context.",
             strengths: ["Advanced reasoning", "1M context", "Strong at code", "Multimodal"],
             weaknesses: ["Higher latency", "Premium pricing"],
             supportsVision: true,
             contextWindow: 1_000_000,
             costTier: .premium
+        ),
+        ModelInfo(
+            id: "gemini-2.5-flash",
+            name: "Gemini 2.5 Flash",
+            provider: "google",
+            description: "Fast, budget-friendly model with built-in thinking capabilities.",
+            strengths: ["Very fast", "Strong multimodal", "Good reasoning", "Low cost"],
+            weaknesses: ["Less consistent on edge cases"],
+            supportsVision: true,
+            contextWindow: 1_000_000,
+            costTier: .low
         ),
     ]
 

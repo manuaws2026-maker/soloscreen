@@ -1,0 +1,114 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for an ad click aggregation system, let me start with the functional requirements.
+
+First, when a user clicks an ad, we need to track that click and redirect them to the advertiser's website. Second, advertisers need to query click metrics over time at 1-minute intervals to see how their campaigns are performing.
+
+For non-functional requirements — the system needs to scale to a peak of 10k clicks per second. Analytics queries for advertisers should be sub-second response time. We cannot lose any click data, so fault tolerance and accuracy are critical. And it should be as real-time as possible — advertisers want to see data shortly after clicks happen, not hours later.
+
+Below the line: fraud and spam detection, demographic and geo profiling of users, and conversion tracking. Those are all important but separate systems.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Track ad clicks and redirect users to advertiser's website
+2. Advertisers can query ad click metrics over time at 1-minute intervals
+
+**Non-Functional Requirements:**
+- Throughput: scale to 10k clicks/second at peak
+- Query latency: sub-second response time for analytics queries
+- Durability: zero click data loss, even during failures
+- Freshness: click data available for querying within minutes of occurring
+
+**Below the Line (Out of Scope):**
+- Fraud or spam detection
+- Demographic and geo profiling of users
+- Conversion tracking[/DETAIL]
+--- SECTION: API Design
+[SAY]So for the API, let me think about inputs and outputs. The input is ad click data from users, and the output is aggregated click metrics for advertisers.
+
+For the click tracking, when a user clicks an ad, we get a POST to /click with the ad ID and an impression ID. The server records the click and returns a 302 redirect to the advertiser's URL. The impression ID is important — I'll come back to why in the deep dives.
+
+For the query side, advertisers hit GET /ads/:adId/metrics with a time range and granularity. This returns aggregated click counts at 1-minute intervals for that ad within the specified window.[/SAY]
+[DETAIL]For data processing questions like this one, it helps to start by defining the system's interface. This includes clearly outline what data the system receives and what it outputs, establishing a clear boundary of the system's functionality. The inputs and outputs of this system are very simple, but it's important to get these right!
+**Input** : Ad click data from users.
+**Output** : Ad click metrics for advertisers.[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, I'd go with two storage layers. Raw click events land in Kafka first for durability, then get processed and written to an OLAP database like Cassandra or ClickHouse that's optimized for time-series aggregation queries. The OLAP store holds pre-aggregated 1-minute rollups keyed by adId and timestamp bucket.
+
+We don't need a traditional relational database here — the workload is almost entirely append-only writes and time-range aggregation reads.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through the architecture one requirement at a time.
+
+For click tracking, when a user clicks an ad, the request hits our Click Processor Service. This service does two things: it immediately returns a 302 redirect to the advertiser's URL so the user experience isn't blocked, and it writes the click event to Kafka for durable async processing.
+
+Now for the processing pipeline — a stream processor like Flink consumes from Kafka, aggregates clicks into 1-minute windows by adId, and writes the rollups to our OLAP database. This gives us the pre-aggregated data advertisers need.
+
+For the query side, advertisers hit a Metrics API Service that reads from the OLAP database. Since the data is already aggregated at 1-minute granularity, these queries are fast.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    User([User Browser]) --> LB[Load Balancer]
+    LB --> CP[Click Processor]
+    CP -->|302 redirect| User
+    CP --> Kafka[Kafka]
+    Kafka --> Flink[Stream Processor / Flink]
+    Flink --> OLAP[(OLAP Database)]
+    Advertiser([Advertiser]) --> AG[API Gateway]
+    AG --> MS[Metrics API Service]
+    MS --> OLAP
+```
+
+**Data Flow:**
+1. **Click tracking**: User clicks ad → Click Processor → 302 redirect + write to Kafka
+2. **Aggregation**: Kafka → Flink (1-minute window aggregation by adId) → OLAP database
+3. **Query**: Advertiser → API Gateway → Metrics API → OLAP database → aggregated results[/DETAIL]
+--- SECTION: Deep Dive: Scale to support 10k clicks per second?
+[SAY]Let me walk through each component and where the bottlenecks are.
+
+The Click Processor is stateless — it just writes to Kafka and returns a redirect. We scale this horizontally with a load balancer in front. At 10k clicks per second, even a few instances can handle this easily.
+
+For Kafka, we need proper partitioning. I'd shard by adId so all events for one ad land in the same partition. This means the stream processor can process each partition independently — no cross-partition coordination needed. Kafka can handle millions of events per second with the right number of partitions and brokers.
+
+The stream processor scales by adding more consumer instances, one per partition. Flink handles this natively with its parallelism model.
+
+And the OLAP database receives pre-aggregated minute-level rollups, not raw clicks, so the write volume is manageable — orders of magnitude less than the raw click rate.[/SAY]
+[DETAIL]**Problem:** How can we scale to support 10k clicks per second?[/DETAIL]
+--- SECTION: Deep Dive: Ensure that we don't lose any click data?
+[SAY]Durability is critical here because every lost click is lost revenue attribution for advertisers. The good news is our architecture already gives us a strong foundation.
+
+Kafka is distributed, fault-tolerant, and replicated across brokers. If a broker goes down, replicas pick up. We configure a retention period — say 7 days — so even if the stream processor goes down, it comes back up and replays from where it left off.
+
+On the Click Processor side, we only return success to the client after the Kafka write is acknowledged with acks=all, meaning the event is replicated before we confirm. If Kafka is temporarily unavailable, the Click Processor returns an error and the client retries.
+
+For the stream processor, we commit Kafka offsets only after successfully writing aggregates to the OLAP database. If Flink crashes mid-batch, it restarts and reprocesses from the last committed offset. We might get duplicate processing, but our aggregation is idempotent — re-counting the same minute window produces the same result.[/SAY]
+[DETAIL]**Problem:** How can we ensure that we don't lose any click data?[/DETAIL]
+--- SECTION: Deep Dive: Prevent abuse from users clicking on ads multiple times?
+[SAY]Right, so click fraud is a massive problem in advertising, but full fraud detection is out of scope. What we do need is basic idempotency — if a user clicks the same ad placement multiple times, we only count it once.
+
+The naive approach of deduping by userId is flawed because users might legitimately see the same ad multiple times across different page loads, and each of those should be its own countable impression.
+
+The better approach is to have the Ad Placement Service generate a unique impression ID for every ad instance shown to a user. Every time an ad is rendered in someone's browser, it gets a fresh impression ID. When the user clicks, that impression ID comes along with the click. Now we deduplicate on impression ID — multiple clicks on the same rendered ad count as one click, but seeing and clicking the same ad on two different pages counts as two separate impressions.
+
+For the dedup itself, we can use a Bloom filter or a Redis set of recently seen impression IDs. We don't need to track these forever — a 24-hour window handles the vast majority of duplicate clicks.[/SAY]
+[DETAIL]**Problem:** How can we prevent abuse from users clicking on ads multiple times?
+
+**Solution:** Great Solution: Generate a Unique impression ID
+ApproachThe better approach is to have the Ad Placement Service generate a unique impression ID for each ad instance shown to each user. Every time an ad is rendered in a user's browser, it gets a fresh impression ID—so if 1000 users see the same Nike ad, that's 1000 different impression IDs. This impression ID would be sent to the browser along with the ad and will serve as an idempotency key. When the user clicks on the ad, the browser sends the impression ID along with the click data. This way we can dedup clicks based on the impression ID.What is an Impression?An ad impression is a metric that represents the display of an ad on a web page. It is counted when the ad is fetched from its source and displayed on the user's screen. If we showed the same user the same ad multiple times in multiple places, then each of these placements is a new impression.But how do we dedup?We won't be able to do this easily in Flink because we need to dedup across aggregation windows. If a duplicate cli...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Add userId To Click Event Payload[/DETAIL]
+--- SECTION: Deep Dive: Ensure that advertisers can query metrics at low latency?
+[SAY]This is largely solved by our stream processing pipeline — data is pre-aggregated at 1-minute granularity and stored in the OLAP database, so most queries are already fast.
+
+Where it can still get slow is when advertisers query larger time windows — days, weeks, or months. Scanning thousands of 1-minute rollup rows and summing them up adds latency.
+
+The solution is multi-level pre-aggregation. We run a periodic job that rolls up our 1-minute data into hourly, daily, and weekly buckets in the same OLAP database. When an advertiser queries the last 30 days, we read from the daily aggregation table instead of summing 43,200 minute-level rows. For the current day, we fall back to minute-level data for freshness.
+
+This is essentially caching through pre-aggregation. We trade some extra storage for dramatically faster queries on the most common time ranges.[/SAY]
+[DETAIL]**Problem:** How can we ensure that advertisers can query metrics at low latency?[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For click deduplication, we chose impression ID-based dedup over userId-based dedup — it requires the Ad Placement Service to generate and attach IDs, but it correctly handles the distinction between legitimate repeated impressions and actual duplicate clicks. For the overall architecture, we chose Kafka plus stream processing over direct database writes — more infrastructure, but we get durability, replay capability, and the ability to handle traffic spikes without dropping clicks. And for query performance, multi-level pre-aggregation over raw queries — extra storage and processing, but sub-second response times for any time range.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Why |
+| --- | --- | --- | --- |
+| How can we prevent abuse from users clicking on ad | Great Solution: Generate a Unique impression ID | Bad Solution: Add userId To Click Event Payload | Better scalability and reliability |[/DETAIL]
+[/SYSDESIGN]

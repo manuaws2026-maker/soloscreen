@@ -5,3 +5,7 @@ build/
 *.xcworkspace/
 DerivedData/
 .DS_Store
+# App bundle binary (built by scripts/build-release.sh)
+SoloScreen.app/Contents/MacOS/
+SoloScreen.app/Contents/Resources/AppIcon.icns
+Resources/AppIcon.icns

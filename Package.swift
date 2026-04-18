@@ -2,12 +2,15 @@
 import PackageDescription
 
 let package = Package(
-    name: "SubtleAI",
+    name: "SoloScreen",
     platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(
-            name: "SubtleAI",
+            name: "SoloScreen",
             path: "Sources",
+            resources: [
+                .process("Resources")
+            ],
             linkerSettings: [
                 .linkedFramework("AppKit"),
                 .linkedFramework("AVFoundation"),
@@ -16,8 +19,8 @@ let package = Package(
             ]
         ),
         .testTarget(
-            name: "SubtleAITests",
-            dependencies: ["SubtleAI"],
+            name: "SoloScreenTests",
+            dependencies: ["SoloScreen"],
             path: "Tests"
         ),
     ]

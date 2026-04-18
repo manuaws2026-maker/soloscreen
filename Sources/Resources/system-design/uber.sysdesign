@@ -1,0 +1,311 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright so for Uber, let me start with the functional requirements — the core things we need to build.
+
+First, riders need to input a pickup and destination and get a fare estimate. Second, they should be able to request a ride based on that estimate. Third, the system needs to match them with a nearby available driver in real time. And fourth, drivers should be able to accept or decline a request and get navigation to pickup and dropoff.
+
+For non-functional requirements — matching needs to be low latency, under a minute or we fail. We need strong consistency in ride matching so no driver gets double-booked. And we need to handle high throughput during peak hours, like 100k requests from the same area during a concert or NYE.
+
+Things I'm putting below the line for now: payment processing, driver ratings, surge pricing, and ride history.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Riders can input pickup + destination → get fare estimate and ETA
+2. Riders can request a ride based on the estimated fare
+3. System matches riders with a nearby, available driver in real time
+4. Drivers can accept/decline ride requests and navigate to pickup/dropoff
+
+**Non-Functional Requirements:**
+- Low-latency matching: < 1 minute to match or failure
+- Strong consistency: no driver assigned multiple rides simultaneously
+- High throughput: handle 100k+ requests from same region during peak events
+- ~10M active drivers sending location updates every ~5 seconds → ~2M writes/sec
+
+**Below the Line (Out of Scope):**
+- Payment processing, surge pricing, driver ratings
+- Ride history and receipts
+- ETA prediction model details
+- Security, GDPR compliance, CI/CD[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Let me define the core entities. We've got five main ones.
+
+A Rider is any user requesting rides — their profile, contact info, payment methods. A Driver is someone registered to provide rides — their details, vehicle info, availability status.
+
+A Fare represents the estimated cost before a ride is confirmed — it has pickup location, destination, estimated price, and ETA. I'm keeping this separate from the Ride entity, though you could combine them.
+
+The Ride entity tracks everything from the moment a rider confirms through completion — rider and driver IDs, vehicle details, state machine for the ride status, route, actual fare charged, and timestamps.
+
+And Location stores real-time driver positions — lat/long coordinates with timestamps. This is critical for matching riders with nearby drivers.[/SAY]
+[DETAIL]- **Rider**: User profile, contact info, preferred payment methods
+- **Driver**: Profile, vehicle info (make/model/year), availability status, preferences
+- **Fare**: Pickup location, destination, estimated fare, estimated ETA. Created when rider searches.
+- **Ride**: Links rider + driver. Tracks state (`REQUESTED → MATCHED → ACCEPTED → IN_PROGRESS → COMPLETED`), route, actual fare, pickup/dropoff timestamps.
+- **Location**: Driver's real-time position (lat, long, timestamp). Updated every ~5 seconds.[/DETAIL]
+--- SECTION: API Design
+[SAY]Here are the key endpoints. First, a POST to /fare that takes pickup location and destination, returns a Fare object with estimated price and ETA. We use POST because we're creating a new Fare entity.
+
+Second, POST to /rides with just the fareId — this confirms the ride request and kicks off the matching process. The matching happens entirely in the backend, so we don't need a separate endpoint for it.
+
+Third, POST to /drivers/location for drivers to update their real-time position. Important — the driverId comes from the session token, not the request body. Never trust client-supplied user IDs.
+
+And fourth, PATCH to /rides/:rideId for the driver to accept or decline. On acceptance, the system updates ride status and returns pickup coordinates.[/SAY]
+[DETAIL]```
+POST /fare → Fare
+Body: { pickupLocation, destination }
+```
+
+```
+POST /rides → Ride
+Body: { fareId }
+// Triggers matching in backend
+```
+
+```
+POST /drivers/location → Success/Error
+Body: { lat, long }
+// driverId from session/JWT — never from body
+```
+
+```
+PATCH /rides/:rideId → Ride
+Body: { action: "accept" | "decline" }
+```
+
+**Security note:** User identity always from session/JWT. Timestamps generated server-side. Fare estimates retrieved from DB, never passed by client.[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, I'd use PostgreSQL for our core transactional data — riders, drivers, fares, rides — because we need strong consistency, especially for ride matching where we can't have double-bookings.
+
+For driver locations though, we'll need something specialized. With 10 million drivers updating every 5 seconds, that's 2 million writes per second. Postgres can't handle that efficiently, and we need geospatial queries too. So I'd use Redis with its geospatial data types for the Location entity — but I'll go deeper on that in the deep dives.[/SAY]
+[DETAIL]| Entity | Storage | Why |
+|--------|---------|-----|
+| Rider, Driver, Fare, Ride | PostgreSQL | ACID transactions, strong consistency for ride matching |
+| Location (real-time) | Redis (geospatial) | 2M writes/sec, GEOSEARCH for proximity queries |
+
+PostgreSQL handles the transactional core. Redis handles the high-throughput, real-time geospatial workload.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through the architecture one requirement at a time.
+
+For fare estimation, the client hits our API Gateway through a load balancer, which routes to a Ride Service that calculates the estimate and stores it in Postgres.
+
+For ride requests, same path — the Ride Service creates a Ride record and hands it off to the Ride Matching Service.
+
+Now here's where it gets interesting. The Ride Matching Service needs to find nearby available drivers, so it queries a Location Service backed by Redis geospatial. It finds candidates, then sends a ride request to the top match via a Push Notification Service.
+
+When the driver accepts, the request comes back through the API Gateway, the Ride Service updates the ride status, and the rider gets notified.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    RC([Rider Client]) --> LB[Load Balancer]
+    DC([Driver Client]) --> LB
+    LB --> AG[API Gateway]
+    AG --> RS[Ride Service]
+    AG --> LS[Location Service]
+    AG --> RMS[Ride Matching Service]
+    RS --> PG[(PostgreSQL)]
+    LS --> Redis[(Redis Geo)]
+    RMS --> PG
+    RMS --> Redis
+    RMS --> PN[Push Notification<br/>Service]
+    PN --> DC
+    PN --> RC
+```
+
+**Data Flow:**
+1. **Fare estimate**: Client → API Gateway → Ride Service → PostgreSQL → response
+2. **Ride request**: Client → Ride Service → creates Ride → Ride Matching Service
+3. **Driver matching**: Ride Matching Service → Location Service (Redis GEOSEARCH) → finds nearby drivers
+4. **Notification**: Ride Matching Service → Push Notification → Driver app
+5. **Accept/Decline**: Driver Client → API Gateway → Ride Service → updates status → notifies rider[/DETAIL]
+--- SECTION: Deep Dive: Driver location updates and proximity search
+[SAY]So the big challenge here is handling 2 million location updates per second from drivers, and then doing efficient proximity searches to find nearby drivers for ride requests.
+
+Our current Postgres setup won't cut it — it'd fall over under the write load, and even with B-tree indexes on lat/long, proximity queries would be painfully slow because traditional indexes aren't built for multi-dimensional geospatial data.
+
+The solution I'd go with is Redis with its geospatial data types. Redis uses geohashing to encode lat/long into a 52-bit integer score within a sorted set. Each driver ID maps to their geohash. This gives us two key commands — GEOADD for updating a driver's location in O(log N), and GEOSEARCH for finding all drivers within a radius in O(N+log M) where N is results and M is total entries.
+
+It's in-memory so writes are blazing fast. And we can set TTL on entries so stale locations expire automatically if a driver goes offline.[/SAY]
+[DETAIL]**Problem:** 2M writes/sec for location updates + efficient proximity queries on 10M drivers
+
+**Solution: Redis Geospatial Data Store**
+
+Redis encodes coordinates using **geohashing** — latitude and longitude become a 52-bit integer score in a sorted set. Each member (driverId) maps to its geohash.
+
+**Key commands:**
+- `GEOADD drivers:locations <long> <lat> <driverId>` — O(log N) per update
+- `GEOSEARCH drivers:locations FROMLONLAT <long> <lat> BYRADIUS 5 km` — O(N+log M)
+
+**Why this works:**
+- In-memory: handles 2M writes/sec easily
+- Geohash-based indexing: proximity queries don't need full table scans
+- Automatic TTL: stale driver locations expire, no cleanup needed
+- Single Redis cluster with sharding by geo-region scales horizontally
+
+**Alternatives considered:**
+- ❌ Direct PostgreSQL writes — can't handle 2M writes/sec, B-tree indexes terrible for 2D proximity
+- ⚠️ Batch writes + PostGIS — better but still high latency, not real-time enough for matching[/DETAIL]
+--- SECTION: Deep Dive: Managing location update frequency
+[SAY]With 10 million drivers pinging every 5 seconds, we're putting a lot of load on the system and network. The insight is that not all updates are equally valuable — if a driver is parked or sitting at a red light, we don't need updates every 5 seconds.
+
+I'd implement adaptive location update intervals on the driver client. The driver's app uses on-device sensors — GPS, accelerometer — to determine the optimal update frequency. If the driver is stationary or moving slowly, updates drop to every 30 seconds. If they're driving fast or changing direction, updates ramp up to every 3-5 seconds.
+
+This is a great example of pushing logic to the client to reduce server load. We can cut total updates by 60-70% without sacrificing accuracy where it matters. The main challenge is getting the algorithm right — too aggressive and we lose accuracy, too conservative and we don't save much.[/SAY]
+[DETAIL]**Problem:** System overload from high-frequency driver location updates (2M/sec)
+
+**Solution: Adaptive Location Update Intervals**
+
+Client-side algorithm dynamically adjusts update frequency based on:
+
+| Condition | Update Interval |
+|-----------|----------------|
+| Stationary / parked | Every 30-60 seconds |
+| Slow movement (< 10 mph) | Every 15 seconds |
+| Normal driving | Every 5 seconds |
+| Fast driving / direction changes | Every 3 seconds |
+| Has pending ride request nearby | Every 2 seconds |
+
+**Impact:** Reduces total updates by ~60-70% while maintaining accuracy for active drivers.
+
+**Key insight:** Push intelligence to the client — use on-device GPS and accelerometer data to make smart decisions about when to send updates.[/DETAIL]
+--- SECTION: Deep Dive: Preventing duplicate ride assignments
+[SAY]This is really about consistency. We said no driver should get double-booked — they should only receive one ride request at a time, and they get 10 seconds to accept or decline before we move to the next driver.
+
+If you've solved Ticketmaster before, this is basically the same pattern — it's like reserving a ticket for checkout with a timeout.
+
+I'd use a distributed lock with TTL in Redis. When the Ride Matching Service picks a driver, it acquires a lock on that driverId with a 10-second TTL. If another ride request tries to grab the same driver, the lock acquisition fails and it moves on.
+
+If the driver accepts within 10 seconds, we update the ride status and release the lock. If they don't respond, the TTL expires automatically, making the driver available again. No manual cleanup needed.
+
+The nice thing about Redis for this is it's atomic — SETNX is our lock, and TTL handles the timeout automatically.[/SAY]
+[DETAIL]**Problem:** Prevent multiple ride requests from being sent to the same driver simultaneously
+
+**Solution: Distributed Lock with TTL (Redis)**
+
+```
+SETNX driver_lock:{driverId} {rideId} EX 10
+```
+
+**Flow:**
+1. Ride Matching Service finds candidate driver
+2. Attempts `SETNX` lock on driverId (10-second TTL)
+3. Lock acquired → send ride request to driver via push notification
+4. Lock fails → driver already has a pending request → try next candidate
+5. Driver accepts → update ride status, `DEL` lock
+6. Driver declines or timeout → lock auto-expires via TTL
+
+**Why Redis locks:**
+- Atomic: SETNX is lock + check in one operation
+- Auto-cleanup: TTL expiration, no manual timeout management
+- Fast: in-memory, sub-millisecond latency
+- Same Redis cluster as location data — no additional infrastructure
+
+**Alternatives:**
+- ❌ Application-level locking — race conditions, no automatic expiry
+- ⚠️ Database status column with polling — higher latency, more complex timeout handling[/DETAIL]
+--- SECTION: Deep Dive: Handling peak demand without dropping rides
+[SAY]During peak periods — concerts, NYE, rush hour — we could get a massive spike in ride requests. If the Ride Matching Service gets overwhelmed or an instance crashes, we'd lose ride requests. That's unacceptable.
+
+The solution is to put a message queue between the ride request and the matching service. When a ride request comes in, it goes into a Kafka topic. The Ride Matching Service consumes from the queue at its own pace.
+
+The key detail is we only commit the Kafka offset after we've successfully found a match. So if a matching service instance crashes mid-processing, the message is still in the queue and another instance picks it up. No rides lost.
+
+We can partition the Kafka topics by geographic region so matching is localized. And we scale matching service instances horizontally — Kafka's consumer groups handle the load distribution automatically. If the queue backs up, we spin up more instances.[/SAY]
+[DETAIL]**Problem:** Ride requests dropped during peak demand or service failures
+
+**Solution: Message Queue (Kafka) with Dynamic Scaling**
+
+```mermaid
+graph LR
+    RS[Ride Service] --> K[Kafka<br/>geo-partitioned]
+    K --> MS1[Matching<br/>Service 1]
+    K --> MS2[Matching<br/>Service 2]
+    K --> MS3[Matching<br/>Service N]
+```
+
+**Key design decisions:**
+- **Kafka offset committed only after successful match** — crashed instances don't lose rides
+- **Geo-partitioned topics** — matching is localized, reduces cross-region queries
+- **Consumer groups** — horizontal scaling, Kafka auto-distributes partitions
+- **Auto-scaling** — monitor queue depth, spin up matching instances when backlog grows
+
+**Guarantees:**
+- At-least-once delivery: no ride request is ever lost
+- Ordered processing within a geographic partition
+- Fault-tolerant: survives matching service crashes and restarts[/DETAIL]
+--- SECTION: Deep Dive: Driver timeout handling
+[SAY]What happens if a driver gets a ride request but just doesn't respond? Maybe they dropped their phone or went on break. We need the system to automatically move on to the next driver after a timeout.
+
+A simple delay queue works, but the better solution is durable execution using something like Temporal or AWS Step Functions. The entire ride matching workflow is modeled as a durable workflow — send request to driver, wait 10 seconds, if they accept we're done, if they timeout or decline we try the next driver.
+
+The beauty of Temporal is that the workflow state is persisted. If the matching service crashes mid-workflow, Temporal resumes it from exactly where it left off. No lost rides, no stuck states. It handles retries, timeouts, and the full state machine of matching automatically.
+
+This pattern also scales nicely — each ride matching is an independent workflow instance.[/SAY]
+[DETAIL]**Problem:** Driver fails to respond to ride request — system must auto-escalate
+
+**Solution: Durable Execution (Temporal / AWS Step Functions)**
+
+**Workflow:**
+1. Send ride request to Driver A, start 10-second timer
+2. Driver A accepts → complete workflow, update ride status
+3. Driver A declines or timeout → release lock, try Driver B
+4. Repeat until match found or all candidates exhausted → notify rider "no drivers available"
+
+**Why durable execution over delay queues:**
+- **Crash-resilient**: workflow state persisted, resumes after service restart
+- **Built-in timeouts**: native timer support, no manual polling
+- **Audit trail**: full history of each matching attempt
+- **Complex logic**: handles retries, fallbacks, and escalation patterns cleanly
+
+**Alternative:** Delay queue (SQS/Redis) — works for simple timeout, but harder to manage multi-step matching with state transitions.[/DETAIL]
+--- SECTION: Deep Dive: Geo-sharding for global scale
+[SAY]At this point we've got a solid design, but everything's running in one region. To really scale globally and reduce latency, I'd shard everything geographically.
+
+Each geographic region gets its own set of services, Kafka partitions, Redis instances, and database shards. A rider in NYC hits the US-East shard, a driver in London hits EU-West. This reduces latency because the servers are physically close to the users, and it isolates load so a spike in one city doesn't affect another.
+
+The one edge case is proximity searches near shard boundaries — a rider near the NYC/NJ border might need to query two shards. We handle this with scatter-gather: query both shards in parallel and merge results. It's a bit more complex but it's a known pattern.
+
+We'd use consistent hashing to distribute data across shards and handle rebalancing when we add new regions.[/SAY]
+[DETAIL]**Problem:** Scale the system globally while reducing latency
+
+**Solution: Geo-Sharding with Read Replicas**
+
+```mermaid
+graph TB
+    subgraph US-East
+        LB1[LB] --> S1[Services]
+        S1 --> R1[(Redis)]
+        S1 --> PG1[(PostgreSQL)]
+        S1 --> K1[Kafka]
+    end
+    subgraph EU-West
+        LB2[LB] --> S2[Services]
+        S2 --> R2[(Redis)]
+        S2 --> PG2[(PostgreSQL)]
+        S2 --> K2[Kafka]
+    end
+    subgraph AP-South
+        LB3[LB] --> S3[Services]
+        S3 --> R3[(Redis)]
+        S3 --> PG3[(PostgreSQL)]
+        S3 --> K3[Kafka]
+    end
+    DNS[GeoDNS] --> LB1
+    DNS --> LB2
+    DNS --> LB3
+```
+
+**Benefits:**
+- Reduced latency: servers co-located with users
+- Isolated failure domains: regional issues don't cascade
+- Horizontal scaling: add shards for new regions
+
+**Edge case — boundary queries:**
+- Scatter-gather across adjacent shards, merge results
+- Use consistent hashing for data distribution and rebalancing[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs in this design. For driver locations, we chose Redis geospatial over PostGIS — we traded durability for the throughput and speed we need at 2 million writes per second. For the ride queue, we went with Kafka over a simple FIFO — more operational complexity, but we get durability, geo-partitioning, and the ability to replay failed requests. For driver timeout handling, Temporal over simple delay queues — more infrastructure to manage, but crash-resilient workflows that handle our complex matching state machine. And for scaling, geo-sharding introduces complexity around boundary queries and data distribution, but it's the only way to achieve global scale with low latency.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Trade-off |
+|----------|--------|-------------|-----------|
+| Driver locations | Redis Geospatial | PostgreSQL + PostGIS | Speed (2M writes/sec) over durability |
+| Location update frequency | Adaptive client-side intervals | Fixed 5s interval | Complexity in client algorithm, but 60-70% fewer updates |
+| Ride matching consistency | Redis distributed lock + TTL | DB status column + polling | Depends on Redis availability, but atomic + auto-expiry |
+| Peak demand handling | Kafka with geo-partitioned topics | Simple FIFO queue | More infra, but durable, scalable, partition-aware |
+| Driver timeout | Temporal durable execution | Delay queue | More infra, but crash-resilient + handles complex workflows |
+| Global scaling | Geo-sharding + read replicas | Vertical scaling | Boundary query complexity, but only path to global scale |[/DETAIL]
+[/SYSDESIGN]

@@ -5,10 +5,14 @@ struct SidebarView: View {
     @State private var renamingSessionId: UUID?
     @State private var renameText: String = ""
 
+    /// Optional callback fired when a session is selected. Used by the
+    /// narrow-mode overlay drawer to dismiss itself after a selection.
+    var onSessionSelected: (() -> Void)? = nil
+
     private let bgColor = Color(hex: "0D1117")
     private let surfaceColor = Color(hex: "161B22")
     private let borderColor = Color(hex: "30363D")
-    private let accentTeal = Color(hex: "00BCD4")
+    private let accentTeal = Color(hex: "22C55E")
 
     var body: some View {
         VStack(spacing: 0) {
@@ -28,6 +32,7 @@ struct SidebarView: View {
             footerBar
         }
         .background(surfaceColor)
+        .clipped()
     }
 
     // MARK: - Header
@@ -40,17 +45,66 @@ struct SidebarView: View {
 
             Spacer()
 
-            Button {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    appState.createSession()
+            // Split button: plus = blank chat, chevron = template menu.
+            HStack(spacing: 0) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        appState.createSession()
+                    }
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 28, height: 22)
                 }
-            } label: {
-                Image(systemName: "plus.circle.fill")
-                    .font(.system(size: 18))
-                    .foregroundStyle(accentTeal)
+                .buttonStyle(.plain)
+                .help("New Chat")
+
+                Rectangle()
+                    .fill(.white.opacity(0.18))
+                    .frame(width: 1, height: 16)
+
+                Menu {
+                    Button("Blank Chat") {
+                        appState.createSession()
+                    }
+                    Divider()
+                    Section("Built-in Templates") {
+                        ForEach(ChatTemplate.builtIns) { template in
+                            Button {
+                                appState.createSession(template: template)
+                            } label: {
+                                Label(template.name, systemImage: template.icon)
+                            }
+                        }
+                    }
+                    if !appState.userTemplates.isEmpty {
+                        Section("My Templates") {
+                            ForEach(appState.userTemplates) { template in
+                                Button {
+                                    appState.createSession(template: template)
+                                } label: {
+                                    Label(template.name, systemImage: template.icon)
+                                }
+                            }
+                        }
+                    }
+                    Divider()
+                    Button("Manage Templates…") {
+                        appState.settingsInitialTab = "Templates"
+                        appState.showSettings = true
+                    }
+                } label: {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 18, height: 22)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .help("New chat from template")
             }
-            .buttonStyle(.plain)
-            .help("New Chat")
+            .background(Capsule().fill(accentTeal))
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
@@ -100,6 +154,7 @@ struct SidebarView: View {
             withAnimation(.easeInOut(duration: 0.15)) {
                 appState.activeSessionId = session.id
             }
+            onSessionSelected?()
         } label: {
             HStack(spacing: 10) {
                 Image(systemName: "bubble.left")
@@ -152,6 +207,7 @@ struct SidebarView: View {
                     .strokeBorder(isActive ? accentTeal.opacity(0.3) : Color.clear, lineWidth: 1)
             )
             .padding(.horizontal, 6)
+            .contentShape(Rectangle())  // make entire row clickable, not just text
         }
         .buttonStyle(.plain)
         .contextMenu {
@@ -198,16 +254,6 @@ struct SidebarView: View {
             .help("Manage Projects")
 
             Spacer()
-
-            Button {
-                appState.showSettings = true
-            } label: {
-                Image(systemName: "gearshape")
-                    .font(.system(size: 14))
-                    .foregroundStyle(.white.opacity(0.55))
-            }
-            .buttonStyle(.plain)
-            .help("Settings")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)

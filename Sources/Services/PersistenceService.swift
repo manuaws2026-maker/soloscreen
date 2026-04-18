@@ -2,7 +2,7 @@ import Foundation
 
 /// Thread-safe local JSON file persistence for sessions, projects, and settings.
 ///
-/// All data is stored in `~/Library/Application Support/SubtleAI/`.
+/// All data is stored in `~/Library/Application Support/SoloScreen/`.
 /// Actor isolation guarantees no concurrent read/write races.
 actor PersistenceService {
 
@@ -16,6 +16,7 @@ actor PersistenceService {
     private let sessionsFileURL: URL
     private let projectsFileURL: URL
     private let settingsFileURL: URL
+    private let templatesFileURL: URL
 
     // MARK: - Encoder / Decoder
 
@@ -65,10 +66,11 @@ actor PersistenceService {
             in: .userDomainMask
         ).first ?? FileManager.default.temporaryDirectory
 
-        baseDirectory = appSupport.appendingPathComponent("SubtleAI", isDirectory: true)
+        baseDirectory = appSupport.appendingPathComponent("SoloScreen", isDirectory: true)
         sessionsFileURL = baseDirectory.appendingPathComponent("sessions.json")
         projectsFileURL = baseDirectory.appendingPathComponent("projects.json")
         settingsFileURL = baseDirectory.appendingPathComponent("settings.json")
+        templatesFileURL = baseDirectory.appendingPathComponent("templates.json")
     }
 
     /// Testable initializer that writes to a custom directory.
@@ -77,6 +79,7 @@ actor PersistenceService {
         sessionsFileURL = directory.appendingPathComponent("sessions.json")
         projectsFileURL = directory.appendingPathComponent("projects.json")
         settingsFileURL = directory.appendingPathComponent("settings.json")
+        templatesFileURL = directory.appendingPathComponent("templates.json")
     }
 
     // MARK: - Directory Setup
@@ -183,6 +186,21 @@ actor PersistenceService {
         } catch {
             logError("Loading settings", error)
             return UserSettings()
+        }
+    }
+
+    // MARK: - Chat Templates (user-defined only; built-ins are hardcoded)
+
+    func saveTemplates(_ templates: [ChatTemplate]) throws {
+        try write(templates, to: templatesFileURL)
+    }
+
+    func loadTemplates() -> [ChatTemplate] {
+        do {
+            return try read([ChatTemplate].self, from: templatesFileURL) ?? []
+        } catch {
+            logError("Loading templates", error)
+            return []
         }
     }
 

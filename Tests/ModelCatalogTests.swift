@@ -1,6 +1,6 @@
 import Testing
 import Foundation
-@testable import SubtleAI
+@testable import SoloScreen
 
 @Suite("ModelCatalog")
 struct ModelCatalogTests {
@@ -129,9 +129,9 @@ struct ModelCatalogTests {
         #expect(model?.provider == "openai")
     }
 
-    @Test("model(withId: claude-sonnet-4-20250514) returns correct model")
+    @Test("model(withId: claude-sonnet-4-6) returns correct model")
     func lookupClaudeSonnet() {
-        let model = ModelCatalog.model(withId: "claude-sonnet-4-20250514")
+        let model = ModelCatalog.model(withId: "claude-sonnet-4-6")
         #expect(model != nil)
         #expect(model?.provider == "anthropic")
     }

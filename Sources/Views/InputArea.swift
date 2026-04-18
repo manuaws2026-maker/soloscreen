@@ -4,20 +4,43 @@ import UniformTypeIdentifiers
 struct InputArea: View {
     @EnvironmentObject var appState: AppState
     @State private var messageText: String = ""
-    @State private var textEditorHeight: CGFloat = 36
+    @State private var editorHeight: CGFloat = 36
     @State private var showFilePicker: Bool = false
+    @State private var pendingFileAttachment: Message.Attachment?
 
     private let bgColor = Color(hex: "0D1117")
     private let surfaceColor = Color(hex: "161B22")
     private let borderColor = Color(hex: "30363D")
-    private let accentTeal = Color(hex: "00BCD4")
+    private let accentTeal = Color(hex: "22C55E")
 
-    private let minHeight: CGFloat = 36
-    private let maxHeight: CGFloat = 120 // ~5 lines
-    private let lineHeight: CGFloat = 21
+    private let minEditorHeight: CGFloat = 36
+    private let maxEditorHeight: CGFloat = 120
+
+    /// Default prompt for a screenshot-only message in a blank chat (no
+    /// template). Gives the LLM clear fallback instructions.
+    fileprivate static let defaultScreenshotPrompt = """
+    Please analyze the attached screenshot(s).
+    - If it contains a task, problem, question, or error, solve it completely.
+    - If it's code, explain or debug it as appropriate.
+    - If anything important is ambiguous, ask a concise clarifying question before proceeding.
+    Otherwise, describe what's shown and suggest the most useful next step.
+    """
+
+    /// Minimal prompt used when the active chat has a template — the template's
+    /// system prompt already tells the LLM how to respond, so we only need to
+    /// point it at the attachment without overriding that guidance.
+    fileprivate static let templateScreenshotPrompt = "Please analyze the attached screenshot(s) and respond per your instructions."
 
     private var canSend: Bool {
-        !messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !appState.isStreaming
+        let hasText = !messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let hasFile = pendingFileAttachment != nil
+        let hasScreenshot = !appState.pendingScreenshots.isEmpty
+        return (hasText || hasFile || hasScreenshot) && !appState.isStreaming
+    }
+
+    /// Whether extreme stealth is active (click-through mode).
+    private var isStealth: Bool {
+        appState.settings.extremeStealthEnabled
     }
 
     var body: some View {
@@ -30,21 +53,200 @@ struct InputArea: View {
                 pendingScreenshotsBar
             }
 
-            // Transcription indicator
-            if appState.isTranscribing {
-                transcriptionIndicator
+            // (Live-listen UI has moved to the top-bar — no inline banner here.)
+
+            // Pending file attachment chip
+            if let file = pendingFileAttachment {
+                HStack(spacing: 8) {
+                    Image(systemName: "doc.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(accentTeal)
+                    Text(file.fileName ?? "File")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.white.opacity(0.7))
+                        .lineLimit(1)
+                    Spacer()
+                    Button {
+                        pendingFileAttachment = nil
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 14))
+                            .foregroundStyle(.white.opacity(0.4))
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 6)
+                .background(accentTeal.opacity(0.08))
             }
 
-            // Input row
-            inputRow
+            // Unified input container
+            VStack(spacing: 0) {
+                // Text editor
+                ZStack(alignment: .leading) {
+                    CompactTextEditor(
+                        text: $messageText,
+                        height: $editorHeight,
+                        minHeight: minEditorHeight,
+                        maxHeight: maxEditorHeight,
+                        placeholder: appState.settings.extremeStealthEnabled ? "" : "Message SoloScreen...",
+                        onCommit: sendIfPossible
+                    )
+                    .frame(height: editorHeight)
+
+                    // Stealth focus hint — shown when in extreme stealth with empty input
+                    if isStealth && messageText.isEmpty {
+                        HStack(spacing: 6) {
+                            Text("⌃⇧I")
+                                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(.green.opacity(0.5))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .fill(.green.opacity(0.06))
+                                )
+                            Text("to focus input")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.white.opacity(0.2))
+                        }
+                        .padding(.leading, 12)
+                        .allowsHitTesting(false)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.top, 8)
+                .padding(.bottom, 4)
+
+                // Bottom row: action buttons + send
+                HStack(spacing: 0) {
+                    HStack(spacing: 2) {
+                        actionButton("camera", active: false, color: accentTeal, tip: "Attach screenshot", shortcut: "⌃⇧S") {
+                            appState.captureScreenshot()
+                        }
+                        actionButton(
+                            appState.isRecordingMic ? "mic.fill" : "mic",
+                            active: appState.isRecordingMic,
+                            color: .red,
+                            tip: appState.isRecordingMic
+                                ? "Stop recording"
+                                : "Dictate into the message box",
+                            shortcut: "⌃⇧R"
+                        ) {
+                            appState.toggleMicRecording()
+                        }
+                        // (Listen Live lives in the top bar now — removed from here.)
+                        // Hide attach in extreme stealth — file picker can't work in click-through mode.
+                        if !isStealth {
+                            actionButton("paperclip", active: false, color: accentTeal, tip: "Attach", shortcut: "⌃⇧A") {
+                                showFilePicker = true
+                            }
+                        }
+                    }
+
+                    Spacer()
+
+                    // Send / Stop button
+                    VStack(spacing: 3) {
+                        Button {
+                            sendIfPossible()
+                        } label: {
+                            Image(systemName: appState.isStreaming ? "stop.fill" : "arrow.up")
+                                .font(.system(size: 12, weight: .bold))
+                                .foregroundStyle(canSend || appState.isStreaming ? .white : .white.opacity(0.25))
+                                .frame(width: 28, height: 28)
+                                .background(
+                                    Circle()
+                                        .fill(canSend || appState.isStreaming ? accentTeal : accentTeal.opacity(0.15))
+                                )
+                        }
+                        .buttonStyle(.plain)
+
+                        if isStealth {
+                            Text(appState.isStreaming ? "Esc" : "↵")
+                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(.green.opacity(0.65))
+                                .lineLimit(1)
+                        }
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.bottom, 8)
+            }
+            .background(
+                RoundedRectangle(cornerRadius: 14)
+                    .fill(bgColor)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14)
+                            .strokeBorder(borderColor, lineWidth: 1)
+                    )
+            )
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
         }
         .background(surfaceColor)
+        .onChange(of: appState.showFilePicker) { _, show in
+            if show {
+                showFilePicker = true
+                appState.showFilePicker = false
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .soloScreenInsertDictation)) { note in
+            // Mic dictation finished — append the transcript to the composer
+            // and focus it so the user can edit or press Enter.
+            guard let text = note.userInfo?["text"] as? String else { return }
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            if messageText.isEmpty {
+                messageText = trimmed
+            } else {
+                messageText += " " + trimmed
+            }
+            NotificationCenter.default.post(name: .soloScreenFocusInput, object: nil)
+        }
         .fileImporter(
             isPresented: $showFilePicker,
-            allowedContentTypes: [.text, .sourceCode, .json, .xml, .yaml, .plainText, .pdf],
+            allowedContentTypes: [
+                .text, .sourceCode, .json, .xml, .yaml, .plainText, .pdf,
+                .image, .png, .jpeg, .webP, .gif, .heic, .bmp, .tiff
+            ],
             allowsMultipleSelection: false
         ) { result in
             handleFileImport(result)
+        }
+    }
+
+    // MARK: - Action Button
+
+    /// Button with optional keyboard shortcut hint shown in extreme stealth mode.
+    private func actionButton(
+        _ icon: String,
+        active: Bool,
+        color: Color,
+        tip: String,
+        shortcut: String?,
+        action: @escaping () -> Void
+    ) -> some View {
+        VStack(spacing: 3) {
+            Button(action: action) {
+                Image(systemName: icon)
+                    .font(.system(size: 13))
+                    .foregroundStyle(active ? color : .white.opacity(0.35))
+                    .frame(width: 28, height: 28)
+                    .background(
+                        Circle()
+                            .fill(active ? color.opacity(0.15) : Color.clear)
+                    )
+            }
+            .buttonStyle(.plain)
+            .help(shortcut != nil ? "\(tip) (\(shortcut!))" : tip)
+
+            if isStealth, let shortcut {
+                Text(shortcut)
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.green.opacity(0.65))
+                    .lineLimit(1)
+            }
         }
     }
 
@@ -87,148 +289,6 @@ struct InputArea: View {
         }
     }
 
-    // MARK: - Transcription Indicator
-
-    private var transcriptionIndicator: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "waveform")
-                .font(.system(size: 12))
-                .foregroundStyle(accentTeal)
-                .symbolEffect(.variableColor.iterative)
-
-            Text("Live transcription active")
-                .font(.system(size: 11))
-                .foregroundStyle(.white.opacity(0.5))
-
-            if !appState.transcriptText.isEmpty {
-                Text(appState.transcriptText)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.7))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-            }
-
-            Spacer()
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 6)
-        .background(accentTeal.opacity(0.06))
-    }
-
-    // MARK: - Input Row
-
-    private var inputRow: some View {
-        HStack(alignment: .bottom, spacing: 8) {
-            // Left action buttons
-            leftActions
-
-            // Text editor
-            textInput
-
-            // Send button
-            sendButton
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-    }
-
-    // MARK: - Left Actions
-
-    private var leftActions: some View {
-        HStack(spacing: 4) {
-            // Screenshot button
-            ToolbarIconButton(
-                icon: "camera",
-                isActive: false,
-                activeColor: accentTeal,
-                help: "Capture Screenshot"
-            ) {
-                appState.captureScreenshot()
-            }
-
-            // Mic button
-            ToolbarIconButton(
-                icon: appState.isRecordingMic ? "mic.fill" : "mic",
-                isActive: appState.isRecordingMic,
-                activeColor: .red,
-                help: appState.isRecordingMic ? "Stop Recording" : "Start Recording"
-            ) {
-                appState.toggleMicRecording()
-            }
-
-            // Transcription button
-            ToolbarIconButton(
-                icon: "waveform",
-                isActive: appState.isTranscribing,
-                activeColor: accentTeal,
-                help: appState.isTranscribing ? "Stop Transcription" : "Start Live Transcription"
-            ) {
-                appState.toggleTranscription()
-            }
-
-            // File attachment button
-            ToolbarIconButton(
-                icon: "paperclip",
-                isActive: false,
-                activeColor: accentTeal,
-                help: "Attach File"
-            ) {
-                showFilePicker = true
-            }
-        }
-    }
-
-    // MARK: - Text Input
-
-    private var textInput: some View {
-        ZStack(alignment: .topLeading) {
-            // Placeholder
-            if messageText.isEmpty {
-                Text("Message SubtleAI...")
-                    .font(.system(size: 14))
-                    .foregroundStyle(.white.opacity(0.3))
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 9)
-                    .allowsHitTesting(false)
-            }
-
-            // Growing TextEditor
-            GrowingTextEditor(
-                text: $messageText,
-                minHeight: minHeight,
-                maxHeight: maxHeight,
-                onCommit: sendIfPossible
-            )
-        }
-        .background(
-            RoundedRectangle(cornerRadius: 12)
-                .fill(bgColor)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12)
-                        .strokeBorder(borderColor, lineWidth: 1)
-                )
-        )
-    }
-
-    // MARK: - Send Button
-
-    private var sendButton: some View {
-        Button {
-            sendIfPossible()
-        } label: {
-            Image(systemName: appState.isStreaming ? "stop.fill" : "arrow.up")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(canSend || appState.isStreaming ? .white : .white.opacity(0.25))
-                .frame(width: 32, height: 32)
-                .background(
-                    Circle()
-                        .fill(canSend || appState.isStreaming ? accentTeal : accentTeal.opacity(0.15))
-                )
-        }
-        .buttonStyle(.plain)
-        .help(appState.isStreaming ? "Stop generating" : "Send message")
-    }
-
     // MARK: - Actions
 
     private func sendIfPossible() {
@@ -238,9 +298,29 @@ struct InputArea: View {
         }
 
         let trimmed = messageText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
 
-        let attachments = appState.pendingScreenshots.map { data in
+        // Build the message content — include file text if attached
+        var messageContent = trimmed
+        if let file = pendingFileAttachment, let fileText = file.textContent {
+            let fileName = file.fileName ?? "File"
+            let fileBlock = "[Attached file: \(fileName)]\n\(fileText)"
+            messageContent = trimmed.isEmpty ? fileBlock : "\(trimmed)\n\n\(fileBlock)"
+        }
+
+        // Allow submitting with no text if at least one screenshot is attached.
+        guard !messageContent.isEmpty || !appState.pendingScreenshots.isEmpty else { return }
+
+        // If the user submits screenshots without any text, inject a default
+        // analyze prompt so the LLM knows what to do with them.
+        //   • Blank chat → verbose fallback instructions.
+        //   • Templated chat → minimal nudge; the template's system prompt
+        //     already defines the response format, don't override it.
+        if messageContent.isEmpty && !appState.pendingScreenshots.isEmpty {
+            let hasTemplate = appState.activeSession?.systemPrompt?.isEmpty == false
+            messageContent = hasTemplate ? Self.templateScreenshotPrompt : Self.defaultScreenshotPrompt
+        }
+
+        var attachments = appState.pendingScreenshots.map { data in
             Message.Attachment(
                 id: UUID(),
                 type: .screenshot,
@@ -249,9 +329,13 @@ struct InputArea: View {
                 mimeType: "image/png"
             )
         }
+        if let file = pendingFileAttachment {
+            attachments.append(file)
+        }
 
-        appState.sendMessage(trimmed, attachments: attachments)
+        appState.sendMessage(messageContent, attachments: attachments)
         messageText = ""
+        pendingFileAttachment = nil
     }
 
     private func handleFileImport(_ result: Result<[URL], Error>) {
@@ -261,15 +345,33 @@ struct InputArea: View {
             guard url.startAccessingSecurityScopedResource() else { return }
             defer { url.stopAccessingSecurityScopedResource() }
 
-            if let data = try? Data(contentsOf: url) {
-                let attachment = Message.Attachment(
-                    id: UUID(),
-                    type: .file,
-                    data: data,
-                    fileName: url.lastPathComponent,
-                    mimeType: url.mimeType
-                )
-                appState.sendMessage("", attachments: [attachment])
+            let mime = url.mimeType
+            let isImage = mime.hasPrefix("image/")
+
+            do {
+                let data = try Data(contentsOf: url)
+
+                if isImage {
+                    // Route images into pendingScreenshots — that's the same
+                    // path system-captured screenshots use, so LLM vision
+                    // models pick them up automatically at send time.
+                    if appState.pendingScreenshots.count >= 5 {
+                        appState.pendingScreenshots.removeFirst()
+                    }
+                    appState.pendingScreenshots.append(data)
+                } else {
+                    let text = try FileProcessorService.extractText(from: url)
+                    pendingFileAttachment = Message.Attachment(
+                        id: UUID(),
+                        type: .file,
+                        data: data,
+                        fileName: url.lastPathComponent,
+                        mimeType: mime,
+                        textContent: text
+                    )
+                }
+            } catch {
+                appState.setError("Failed to read file: \(error.localizedDescription)")
             }
         case .failure:
             break
@@ -277,12 +379,16 @@ struct InputArea: View {
     }
 }
 
-// MARK: - Growing Text Editor
+// MARK: - Compact Text Editor (NSViewRepresentable)
 
-private struct GrowingTextEditor: NSViewRepresentable {
+/// A compact auto-growing text editor backed by NSTextView.
+/// Reports its ideal height via a binding so SwiftUI can size it correctly.
+private struct CompactTextEditor: NSViewRepresentable {
     @Binding var text: String
+    @Binding var height: CGFloat
     let minHeight: CGFloat
     let maxHeight: CGFloat
+    let placeholder: String
     let onCommit: () -> Void
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -299,17 +405,36 @@ private struct GrowingTextEditor: NSViewRepresentable {
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticTextReplacementEnabled = false
-        textView.textContainerInset = NSSize(width: 8, height: 8)
-        textView.insertionPointColor = NSColor(Color(hex: "00BCD4"))
+        textView.textContainerInset = NSSize(width: 4, height: 4)
+        textView.insertionPointColor = NSColor(Color(hex: "22C55E"))
+
+        applyPlaceholder(to: textView, text: placeholder)
 
         scrollView.hasVerticalScroller = false
         scrollView.hasHorizontalScroller = false
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
 
-        let heightConstraint = scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: minHeight)
-        heightConstraint.isActive = true
-        context.coordinator.heightConstraint = heightConstraint
+        // Listen for ⌃⇧I focus-input hotkey.
+        context.coordinator.focusObserver = NotificationCenter.default.addObserver(
+            forName: .soloScreenFocusInput, object: nil, queue: .main
+        ) { [weak textView] _ in
+            guard let textView, let window = textView.window else { return }
+            if window.firstResponder === textView {
+                window.makeFirstResponder(nil)
+            } else {
+                // Click-through mode normally blocks the panel from becoming
+                // key — so keyboard focus would bounce right back. Enable
+                // `allowKeyTemporarily` AND KEEP it on until focus is
+                // released, so the user can actually type continuously.
+                (window as? KeyablePanel)?.allowKeyTemporarily = true
+                window.makeKey()
+                window.makeFirstResponder(textView)
+                // NOTE: we intentionally do NOT reset `allowKeyTemporarily`
+                // here. It stays true for the duration of the input session,
+                // and gets reset when the text view resigns first responder.
+            }
+        }
 
         return scrollView
     }
@@ -318,79 +443,87 @@ private struct GrowingTextEditor: NSViewRepresentable {
         guard let textView = scrollView.documentView as? NSTextView else { return }
         if textView.string != text {
             textView.string = text
-            context.coordinator.updateHeight(textView: textView, scrollView: scrollView)
+            DispatchQueue.main.async {
+                context.coordinator.recalcHeight(textView: textView)
+            }
         }
+        applyPlaceholder(to: textView, text: placeholder)
+    }
+
+    private func applyPlaceholder(to textView: NSTextView, text: String) {
+        let attributed = NSAttributedString(
+            string: text,
+            attributes: [
+                .foregroundColor: NSColor.white.withAlphaComponent(0.28),
+                .font: NSFont.systemFont(ofSize: 14),
+            ]
+        )
+        textView.setValue(attributed, forKey: "placeholderAttributedString")
     }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
     }
 
-    class Coordinator: NSObject, NSTextViewDelegate {
-        let parent: GrowingTextEditor
-        var heightConstraint: NSLayoutConstraint?
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        let parent: CompactTextEditor
+        var focusObserver: Any?
 
-        init(parent: GrowingTextEditor) {
+        init(parent: CompactTextEditor) {
             self.parent = parent
+        }
+
+        deinit {
+            if let focusObserver { NotificationCenter.default.removeObserver(focusObserver) }
         }
 
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
             parent.text = textView.string
-            if let scrollView = textView.enclosingScrollView {
-                updateHeight(textView: textView, scrollView: scrollView)
-            }
+            recalcHeight(textView: textView)
         }
 
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
             if commandSelector == #selector(NSResponder.insertNewline(_:)) {
-                let event = NSApp.currentEvent
-                if event?.modifierFlags.contains(.shift) == true {
+                if NSApp.currentEvent?.modifierFlags.contains(.shift) == true {
                     textView.insertNewlineIgnoringFieldEditor(nil)
                     return true
                 } else {
                     parent.onCommit()
+                    resignAndRestorePassthrough(textView: textView)
                     return true
                 }
+            }
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                // Escape pressed — give up focus and drop the key grant so
+                // clicks pass through again in extreme stealth mode.
+                resignAndRestorePassthrough(textView: textView)
+                return true
             }
             return false
         }
 
-        func updateHeight(textView: NSTextView, scrollView: NSScrollView) {
+        /// Blur the text view and flip `allowKeyTemporarily` back off so
+        /// click-through behavior is restored after the user stops typing.
+        private func resignAndRestorePassthrough(textView: NSTextView) {
+            guard let window = textView.window else { return }
+            window.makeFirstResponder(nil)
+            (window as? KeyablePanel)?.allowKeyTemporarily = false
+        }
+
+        func recalcHeight(textView: NSTextView) {
             guard let layoutManager = textView.layoutManager,
                   let textContainer = textView.textContainer else { return }
 
             layoutManager.ensureLayout(for: textContainer)
-            let contentHeight = layoutManager.usedRect(for: textContainer).height + textView.textContainerInset.height * 2
-            let clampedHeight = min(max(contentHeight, parent.minHeight), parent.maxHeight)
-            heightConstraint?.constant = clampedHeight
+            let contentHeight = layoutManager.usedRect(for: textContainer).height
+                + textView.textContainerInset.height * 2
+            let clamped = min(max(contentHeight, parent.minHeight), parent.maxHeight)
+
+            if abs(parent.height - clamped) > 1 {
+                parent.height = clamped
+            }
         }
-    }
-}
-
-// MARK: - Toolbar Icon Button
-
-private struct ToolbarIconButton: View {
-    let icon: String
-    let isActive: Bool
-    let activeColor: Color
-    let help: String
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Image(systemName: icon)
-                .font(.system(size: 14))
-                .foregroundStyle(isActive ? activeColor : .white.opacity(0.4))
-                .frame(width: 30, height: 30)
-                .background(
-                    Circle()
-                        .fill(isActive ? activeColor.opacity(0.15) : Color.clear)
-                )
-                .animation(.easeInOut(duration: 0.15), value: isActive)
-        }
-        .buttonStyle(.plain)
-        .help(help)
     }
 }
 

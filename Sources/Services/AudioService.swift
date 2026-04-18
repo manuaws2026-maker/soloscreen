@@ -326,11 +326,27 @@ final class AudioService: ObservableObject {
 
 // MARK: - SCStream Audio Output Handler
 
-/// Receives audio sample buffers from ScreenCaptureKit's system audio stream
-/// and forwards the raw PCM data to a callback.
+/// Receives audio sample buffers from ScreenCaptureKit's system audio stream,
+/// converts them to 16 kHz mono 16-bit PCM (Deepgram's `linear16` format),
+/// and forwards the raw bytes to a callback.
+///
+/// ScreenCaptureKit almost always delivers Float32 non-interleaved PCM at
+/// 48 kHz regardless of what we ask for in `SCStreamConfiguration`. Trying
+/// to read that as Int16 produces garbage — which is why the bar graph
+/// went flat and Deepgram got no decodable audio before this fix.
 private final class SystemAudioStreamOutput: NSObject, SCStreamOutput, @unchecked Sendable {
 
     private let onAudioBuffer: (Data) -> Void
+    private var converter: AVAudioConverter?
+    private var lastInputFormat: AVAudioFormat?
+    private let targetFormat: AVAudioFormat = {
+        AVAudioFormat(
+            commonFormat: .pcmFormatInt16,
+            sampleRate: 16_000,
+            channels: 1,
+            interleaved: true
+        )!
+    }()
 
     init(onAudioBuffer: @escaping (Data) -> Void) {
         self.onAudioBuffer = onAudioBuffer
@@ -340,18 +356,88 @@ private final class SystemAudioStreamOutput: NSObject, SCStreamOutput, @unchecke
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .audio else { return }
 
-        // Extract audio data from the CMSampleBuffer.
-        guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
+        // 1. Derive the incoming audio format from the sample buffer.
+        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription),
+              let inputFormat = AVAudioFormat(streamDescription: asbdPtr)
+        else { return }
 
-        let length = CMBlockBufferGetDataLength(blockBuffer)
-        guard length > 0 else { return }
-
-        var data = Data(count: length)
-        data.withUnsafeMutableBytes { rawBuffer in
-            guard let ptr = rawBuffer.baseAddress else { return }
-            CMBlockBufferCopyDataBytes(blockBuffer, atOffset: 0, dataLength: length, destination: ptr)
+        // 2. Build/cache a converter whenever the format changes.
+        if converter == nil || lastInputFormat != inputFormat {
+            converter = AVAudioConverter(from: inputFormat, to: targetFormat)
+            lastInputFormat = inputFormat
         }
+        guard let converter else { return }
 
+        // 3. Wrap the sample buffer's audio as an AVAudioPCMBuffer without copying.
+        guard let inputBuffer = Self.makeAVAudioPCMBuffer(
+            from: sampleBuffer,
+            format: inputFormat
+        ) else { return }
+
+        // 4. Allocate an output buffer sized for the converted frames.
+        let ratio = targetFormat.sampleRate / inputFormat.sampleRate
+        let outputCapacity = AVAudioFrameCount(Double(inputBuffer.frameLength) * ratio) + 16
+        guard let outputBuffer = AVAudioPCMBuffer(
+            pcmFormat: targetFormat,
+            frameCapacity: outputCapacity
+        ) else { return }
+
+        // 5. Convert.
+        var consumed = false
+        let inputBlock: AVAudioConverterInputBlock = { _, status in
+            if consumed {
+                status.pointee = .noDataNow
+                return nil
+            }
+            consumed = true
+            status.pointee = .haveData
+            return inputBuffer
+        }
+        var error: NSError?
+        let result = converter.convert(to: outputBuffer, error: &error, withInputFrom: inputBlock)
+        guard result != .error else { return }
+
+        // 6. Extract the Int16 bytes and ship them to the callback.
+        let frames = Int(outputBuffer.frameLength)
+        guard frames > 0, let int16Data = outputBuffer.int16ChannelData else { return }
+        let byteCount = frames * MemoryLayout<Int16>.size
+        let data = Data(bytes: int16Data[0], count: byteCount)
         onAudioBuffer(data)
+    }
+
+    /// Materialise an AVAudioPCMBuffer from a CMSampleBuffer's audio bytes.
+    /// Uses `CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer` so the
+    /// bytes stay owned by CoreMedia for the duration of the copy.
+    private static func makeAVAudioPCMBuffer(
+        from sampleBuffer: CMSampleBuffer,
+        format: AVAudioFormat
+    ) -> AVAudioPCMBuffer? {
+        let numSamples = CMSampleBufferGetNumSamples(sampleBuffer)
+        guard numSamples > 0 else { return nil }
+
+        var blockBuffer: CMBlockBuffer?
+        var audioBufferList = AudioBufferList(
+            mNumberBuffers: 1,
+            mBuffers: AudioBuffer(mNumberChannels: 0, mDataByteSize: 0, mData: nil)
+        )
+        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: nil,
+            bufferListOut: &audioBufferList,
+            bufferListSize: MemoryLayout<AudioBufferList>.size,
+            blockBufferAllocator: nil,
+            blockBufferMemoryAllocator: nil,
+            flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+            blockBufferOut: &blockBuffer
+        )
+        guard status == noErr, blockBuffer != nil else { return nil }
+
+        guard let pcmBuffer = AVAudioPCMBuffer(
+            pcmFormat: format,
+            bufferListNoCopy: &audioBufferList
+        ) else { return nil }
+        pcmBuffer.frameLength = AVAudioFrameCount(numSamples)
+        return pcmBuffer
     }
 }

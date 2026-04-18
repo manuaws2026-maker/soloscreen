@@ -1,14 +1,15 @@
 import AppKit
+import Combine
 import SwiftUI
 
-/// Application delegate that configures SubtleAI as a menu-bar-only app
+/// Application delegate that configures SoloScreen as a menu-bar-only app
 /// with a stealth floating overlay window.
 ///
 /// Sets the activation policy to `.accessory` (no dock icon), creates a
 /// status bar item for quick access, and initialises the stealth window
 /// with the main SwiftUI view hierarchy.
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate {
 
     // MARK: - Properties
 
@@ -16,6 +17,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var stealthWindowManager: StealthWindowManager?
     private var appState: AppState?
     private var shortcutService: ShortcutService?
+    private var settingsCancellable: AnyCancellable?
+    private var showSettingsCancellable: AnyCancellable?
+    private var showDiagramCancellable: AnyCancellable?
+    private var settingsWindow: NSWindow?
+    private var diagramWindow: NSWindow?
+    private var minimizeObserver: Any?
 
     // MARK: - Application Lifecycle
 
@@ -40,11 +47,112 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowManager.setOpacity(state.settings.overlayOpacity)
         windowManager.setExtremeStealth(state.settings.extremeStealthEnabled)
 
-        // Set up the status bar item.
-        setupStatusBar()
+        // Install a main menu with standard Edit actions (Cmd+C/V/X/A).
+        // Without this, paste doesn't work in text fields because .accessory
+        // apps have no menu bar and no default Edit menu.
+        setupMainMenu()
+
+        // Status bar item is created lazily based on stealth — see
+        // observeSettings below. In stealth mode there is no menu bar icon
+        // (it would be visible in screen shares and defeat stealth).
 
         // Register global keyboard shortcuts.
         setupShortcuts()
+
+        // Observe settings changes and propagate to the window manager.
+        observeSettings(state: state, windowManager: windowManager)
+
+        // Open / close the floating Settings window based on app state.
+        // No `.removeDuplicates()` — clicking the gear while the state is
+        // already `true` must still re-surface the window in case it got
+        // hidden by space switching or an accidental orderOut.
+        showSettingsCancellable = state.$showSettings
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] shouldShow in
+                if shouldShow {
+                    self?.showSettingsWindow(appState: state)
+                } else {
+                    self?.closeSettingsWindow()
+                }
+            }
+
+        // Open / close the floating Diagram expansion window.
+        showDiagramCancellable = state.$showExpandedDiagram
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] shouldShow in
+                if shouldShow {
+                    self?.showDiagramWindow(appState: state)
+                } else {
+                    self?.closeDiagramWindow()
+                }
+            }
+
+        // Listen for minimize requests from SwiftUI views.
+        // Every time any window (main panel, settings, sheets, popovers that
+        // back onto NSWindow) becomes key, enforce the current stealth +
+        // opacity settings on it. Catches SwiftUI .sheet windows we don't
+        // construct ourselves.
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self, let window = note.object as? NSWindow else { return }
+            guard let s = self.appState?.settings else { return }
+            window.sharingType = s.stealthEnabled ? .none : .readOnly
+            // Stick with solid opacity for the main panel / settings; leave
+            // child popovers alone (they look weird dimmed).
+        }
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didUpdateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self, let window = note.object as? NSWindow else { return }
+            guard let s = self.appState?.settings else { return }
+            // Redundant but defends against transient windows that never
+            // become key (some sheets on older macOS versions).
+            window.sharingType = s.stealthEnabled ? .none : .readOnly
+        }
+
+        minimizeObserver = NotificationCenter.default.addObserver(
+            forName: .soloScreenMinimizeWindow,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.stealthWindowManager?.toggleMinimize()
+            }
+        }
+
+        // Prompt for permissions the app relies on (Screen Recording for
+        // Live Listen). Done after the UI is up so the system dialog isn't
+        // the first thing the user sees.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.requestScreenRecordingPermissionIfNeeded()
+        }
+    }
+
+    // MARK: - Permissions
+
+    /// ScreenCaptureKit (used by Live Listen to capture system audio) is
+    /// gated on the Screen Recording permission. Ask for it once on launch;
+    /// macOS only shows its native dialog the first time — after that the
+    /// app needs to be toggled on manually in System Settings.
+    private func requestScreenRecordingPermissionIfNeeded() {
+        if CGPreflightScreenCaptureAccess() {
+            return
+        }
+        // Kicks off the system prompt the first time; if the user previously
+        // declined, returns false silently without dialog — in that case we
+        // surface a banner with a button to jump to System Settings.
+        let granted = CGRequestScreenCaptureAccess()
+        if !granted {
+            appState?.setError(
+                "Live Listen needs the Screen Recording permission to hear system audio. Enable SoloScreen in System Settings → Privacy & Security → Screen Recording.",
+                systemSettingsURL: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+            )
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -58,62 +166,117 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         false
     }
 
+    // MARK: - Main Menu (for standard keyboard shortcuts)
+
+    private func setupMainMenu() {
+        let mainMenu = NSMenu()
+
+        // App menu (required but can be minimal)
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(NSMenuItem(title: "Quit SoloScreen", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+
+        // Edit menu — enables Cmd+C/V/X/A in text fields
+        let editMenuItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(NSMenuItem(title: "Undo", action: Selector(("undo:")), keyEquivalent: "z"))
+        editMenu.addItem(NSMenuItem(title: "Redo", action: Selector(("redo:")), keyEquivalent: "Z"))
+        editMenu.addItem(NSMenuItem.separator())
+        editMenu.addItem(NSMenuItem(title: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x"))
+        editMenu.addItem(NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c"))
+        editMenu.addItem(NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
+        editMenu.addItem(NSMenuItem(title: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
+        editMenuItem.submenu = editMenu
+        mainMenu.addItem(editMenuItem)
+
+        NSApplication.shared.mainMenu = mainMenu
+    }
+
     // MARK: - Status Bar
 
     private func setupStatusBar() {
         statusBarItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
 
         if let button = statusBarItem?.button {
-            button.image = NSImage(
-                systemSymbolName: "bubble.left.and.text.bubble.right.fill",
-                accessibilityDescription: "SubtleAI"
-            )
-            button.image?.size = NSSize(width: 18, height: 18)
-            button.image?.isTemplate = true
+            if let brain = loadBrainIcon() {
+                let composed = composeMenuBarIcon(brain: brain)
+                composed.isTemplate = false  // keep colorful gradient
+                button.image = composed
+            } else {
+                // Fallback if the resource is missing
+                button.image = NSImage(
+                    systemSymbolName: "eye.slash.circle.fill",
+                    accessibilityDescription: "SoloScreen"
+                )
+                button.image?.size = NSSize(width: 18, height: 18)
+                button.image?.isTemplate = true
+            }
         }
 
+        // Menu items are built dynamically in `menuNeedsUpdate(_:)` so they
+        // reflect the current panel state (visible / hidden / minimized).
         let menu = NSMenu()
-
-        let showHideItem = NSMenuItem(
-            title: "Show / Hide",
-            action: #selector(toggleOverlayVisibility),
-            keyEquivalent: ""
-        )
-        showHideItem.target = self
-        menu.addItem(showHideItem)
-
-        menu.addItem(NSMenuItem.separator())
-
-        let newSessionItem = NSMenuItem(
-            title: "New Session",
-            action: #selector(createNewSession),
-            keyEquivalent: "n"
-        )
-        newSessionItem.keyEquivalentModifierMask = [.command, .shift]
-        newSessionItem.target = self
-        menu.addItem(newSessionItem)
-
-        let settingsItem = NSMenuItem(
-            title: "Settings...",
-            action: #selector(openSettings),
-            keyEquivalent: ","
-        )
-        settingsItem.keyEquivalentModifierMask = .command
-        settingsItem.target = self
-        menu.addItem(settingsItem)
-
-        menu.addItem(NSMenuItem.separator())
-
-        let quitItem = NSMenuItem(
-            title: "Quit SubtleAI",
-            action: #selector(quitApp),
-            keyEquivalent: "q"
-        )
-        quitItem.keyEquivalentModifierMask = .command
-        quitItem.target = self
-        menu.addItem(quitItem)
-
+        menu.delegate = self
         statusBarItem?.menu = menu
+    }
+
+    // MARK: - Dynamic Status Bar Menu
+
+    /// Rebuild the status-bar menu based on the current panel state so the
+    /// items always match what the user can actually do right now.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+
+        let state = stealthWindowManager?.state ?? .visible
+
+        switch state {
+        case .visible:
+            menu.addItem(makeItem("Hide Window", action: #selector(hideWindowAction), shortcut: "space", mods: [.control, .shift]))
+            menu.addItem(makeItem("Minimize to Dot", action: #selector(minimizeToDotAction), shortcut: "m", mods: [.control, .shift]))
+        case .hidden:
+            menu.addItem(makeItem("Show Window", action: #selector(showWindowAction), shortcut: "space", mods: [.control, .shift]))
+        case .minimized:
+            menu.addItem(makeItem("Restore Window", action: #selector(restoreFromDotAction), shortcut: "m", mods: [.control, .shift]))
+            menu.addItem(makeItem("Hide Completely", action: #selector(hideCompletelyAction), shortcut: "", mods: []))
+        }
+
+        menu.addItem(NSMenuItem.separator())
+
+        menu.addItem(makeItem("New Session", action: #selector(createNewSession), shortcut: "n", mods: [.command, .shift]))
+        menu.addItem(makeItem("Settings…", action: #selector(openSettings), shortcut: ",", mods: .command))
+
+        menu.addItem(NSMenuItem.separator())
+
+        menu.addItem(makeItem("Quit SoloScreen", action: #selector(quitApp), shortcut: "q", mods: .command))
+    }
+
+    private func makeItem(_ title: String, action: Selector, shortcut: String, mods: NSEvent.ModifierFlags) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: shortcut)
+        item.keyEquivalentModifierMask = mods
+        item.target = self
+        return item
+    }
+
+    // MARK: - Menu Bar Icon Composition
+
+    private func loadBrainIcon() -> NSImage? {
+        guard let url = Bundle.module.url(forResource: "BrainIcon", withExtension: "png") else { return nil }
+        return NSImage(contentsOf: url)
+    }
+
+    /// Draw the brain directly at 22×22 with a fully transparent background
+    /// so it composites naturally on any menu bar wallpaper/tint.
+    private func composeMenuBarIcon(brain: NSImage) -> NSImage {
+        let size: CGFloat = 22
+        let image = NSImage(size: NSSize(width: size, height: size))
+        image.lockFocus()
+        defer { image.unlockFocus() }
+
+        let rect = NSRect(x: 0, y: 0, width: size, height: size)
+        brain.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1.0)
+        return image
     }
 
     // MARK: - Status Bar Actions
@@ -122,19 +285,284 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stealthWindowManager?.toggleVisibility()
     }
 
-    @objc private func createNewSession() {
-        appState?.createSession()
+    @objc private func hideWindowAction() {
+        stealthWindowManager?.hide()
+    }
+
+    @objc private func showWindowAction() {
         stealthWindowManager?.show()
     }
 
+    @objc private func minimizeToDotAction() {
+        stealthWindowManager?.minimize()
+    }
+
+    @objc private func restoreFromDotAction() {
+        stealthWindowManager?.restore()
+    }
+
+    @objc private func hideCompletelyAction() {
+        stealthWindowManager?.hideCompletely()
+    }
+
+    @objc private func createNewSession() {
+        // If minimized, restore the full window so the new chat is actually visible.
+        if stealthWindowManager?.state == .minimized {
+            stealthWindowManager?.restore()
+        } else {
+            stealthWindowManager?.show()
+        }
+        appState?.createSession()
+    }
+
     @objc private func openSettings() {
+        if stealthWindowManager?.state == .minimized {
+            stealthWindowManager?.restore()
+        } else {
+            stealthWindowManager?.show()
+        }
         appState?.showSettings = true
-        stealthWindowManager?.show()
     }
 
     @objc private func quitApp() {
         appState?.saveAllState()
         NSApplication.shared.terminate(nil)
+    }
+
+    // MARK: - Settings Observation
+
+    /// Watch for changes to AppState settings and propagate them to the window manager.
+    private func observeSettings(state: AppState, windowManager: StealthWindowManager) {
+        settingsCancellable = state.$settings
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] settings in
+                guard let self else { return }
+                windowManager.setStealth(settings.stealthEnabled)
+                windowManager.setExtremeStealth(settings.extremeStealthEnabled)
+                windowManager.setOpacity(settings.overlayOpacity)
+
+                // Keep the settings window's stealth + opacity in sync.
+                // (We deliberately DON'T apply extreme stealth / click-through
+                // here — settings has sliders and toggles the user needs to
+                // actually interact with.)
+                self.applyStealthToSettingsWindow(
+                    stealthEnabled: settings.stealthEnabled,
+                    opacity: settings.overlayOpacity
+                )
+
+                // Status bar icon: only show when NOT in stealth, because the
+                // menu bar is captured by screen share / recordings and would
+                // otherwise leak SoloScreen's presence.
+                self.updateStatusBarVisibility(stealth: settings.stealthEnabled)
+
+                // Auto-collapse sidebar in extreme stealth to maximize content area.
+                if settings.extremeStealthEnabled {
+                    self.appState?.sidebarVisible = false
+                }
+            }
+    }
+
+    private func applyStealthToSettingsWindow(stealthEnabled: Bool, opacity: Double) {
+        guard let w = settingsWindow else { return }
+        w.sharingType = stealthEnabled ? .none : .readOnly
+        w.alphaValue = CGFloat(max(0.25, min(1.0, opacity)))
+        // Also sweep any child sheets / popovers that SwiftUI may have
+        // spawned off the settings window (template editor, alerts, etc.).
+        for child in w.childWindows ?? [] {
+            child.sharingType = stealthEnabled ? .none : .readOnly
+        }
+        // And any other NSApp-owned windows in flight — covers SwiftUI
+        // sheets that aren't registered as child-windows on macOS 14+.
+        for window in NSApp.windows {
+            window.sharingType = stealthEnabled ? .none : .readOnly
+        }
+    }
+
+    // MARK: - Settings Window
+
+    /// Open a floating Settings window centered on the screen. A regular
+    /// titled NSWindow — NOT a sheet — so it doesn't anchor to our
+    /// right-edge panel. sharingType = .none so API keys inside stay hidden
+    /// from screen capture.
+    private func showSettingsWindow(appState: AppState) {
+        if let w = settingsWindow {
+            // Pull forward even if it's already "open" — the user may have
+            // space-switched away and `.transient` hid it from view.
+            NSApp.activate(ignoringOtherApps: true)
+            w.orderFrontRegardless()
+            w.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        let contentRect = NSRect(x: 0, y: 0, width: 820, height: 760)
+        let window = NSWindow(
+            contentRect: contentRect,
+            styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "SoloScreen Settings"
+        // Force a dark titlebar + let the SettingsView's black bg extend
+        // under it so the header matches the content seamlessly.
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden   // the SettingsView already renders its own "Settings" heading
+        window.backgroundColor = NSColor(red: 0x0D/255.0, green: 0x11/255.0, blue: 0x17/255.0, alpha: 1.0)
+        window.isMovableByWindowBackground = true
+        window.isReleasedWhenClosed = false
+        // Hide from Mission Control / Exposé / Window menu / window list so
+        // the settings window doesn't betray the app's presence the way the
+        // main stealth panel carefully avoids.
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        window.isExcludedFromWindowsMenu = true
+        window.hidesOnDeactivate = false
+        // Match the main panel's stealth + opacity settings.
+        let s = appState.settings
+        window.sharingType = s.stealthEnabled ? .none : .readOnly
+        window.alphaValue = CGFloat(max(0.25, min(1.0, s.overlayOpacity)))
+        window.minSize = NSSize(width: 720, height: 680)
+        window.delegate = self       // sync close button → appState.showSettings = false
+        window.center()
+
+        let host = NSHostingController(
+            rootView: SettingsView().environmentObject(appState)
+        )
+        window.contentViewController = host
+
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        self.settingsWindow = window
+    }
+
+    private func closeSettingsWindow() {
+        settingsWindow?.close()
+    }
+
+    // MARK: - Diagram Window
+
+    /// Open the diagram expansion in a dedicated stealth NSWindow centered
+    /// on screen — follows the exact same pattern as Settings.
+    private func showDiagramWindow(appState: AppState) {
+        guard let image = appState.lastDiagramImage,
+              let source = appState.lastDiagramSource else { return }
+
+        if let w = diagramWindow {
+            // Update content, resize to fit, and bring forward.
+            let host = NSHostingController(
+                rootView: ZoomableDiagramOverlay(
+                    image: image,
+                    source: source,
+                    onClose: { [weak self] in
+                        self?.appState?.showExpandedDiagram = false
+                    }
+                )
+            )
+            w.contentViewController = host
+            // Resize to fit the new diagram.
+            let screen = w.screen ?? NSScreen.main ?? NSScreen.screens.first
+            let sf = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+            let chrome: CGFloat = 92
+            let winW = max(500, min(image.size.width * 2 + 48, sf.width * 0.9))
+            let winH = max(400, min(image.size.height * 2 + chrome + 48, sf.height * 0.9))
+            w.setContentSize(NSSize(width: winW, height: winH))
+            w.center()
+            NSApp.activate(ignoringOtherApps: true)
+            w.orderFrontRegardless()
+            w.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        // Size the window to fit the diagram at ~2× inline size, capped
+        // to 90% of the screen so it never overflows.
+        let screen = NSScreen.main ?? NSScreen.screens.first
+        let screenFrame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let maxW = screenFrame.width * 0.9
+        let maxH = screenFrame.height * 0.9
+        // Target 2× the image's natural size + chrome (toolbar ~44pt + padding)
+        let chrome: CGFloat = 92
+        let imgW = min(image.size.width * 2 + 48, maxW)
+        let imgH = min(image.size.height * 2 + chrome + 48, maxH)
+        let winW = max(500, imgW)
+        let winH = max(400, imgH)
+
+        let contentRect = NSRect(x: 0, y: 0, width: winW, height: winH)
+        let window = NSWindow(
+            contentRect: contentRect,
+            styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Diagram"
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.backgroundColor = NSColor(red: 0x0D/255.0, green: 0x11/255.0, blue: 0x17/255.0, alpha: 1.0)
+        window.isMovableByWindowBackground = true
+        window.isReleasedWhenClosed = false
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        window.isExcludedFromWindowsMenu = true
+        window.hidesOnDeactivate = false
+        let s = appState.settings
+        window.sharingType = s.stealthEnabled ? .none : .readOnly
+        window.alphaValue = CGFloat(max(0.25, min(1.0, s.overlayOpacity)))
+        window.minSize = NSSize(width: 500, height: 400)
+        window.delegate = self
+        window.center()
+
+        let host = NSHostingController(
+            rootView: ZoomableDiagramOverlay(
+                image: image,
+                source: source,
+                onClose: { [weak self] in
+                    self?.appState?.showExpandedDiagram = false
+                }
+            )
+        )
+        window.contentViewController = host
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        self.diagramWindow = window
+    }
+
+    private func closeDiagramWindow() {
+        diagramWindow?.close()
+    }
+
+    // MARK: - NSWindowDelegate
+
+    /// When the user hits the red close button, keep our app state in sync.
+    func windowWillClose(_ notification: Notification) {
+        guard let win = notification.object as? NSWindow else { return }
+
+        if win === settingsWindow {
+            settingsWindow = nil
+            if appState?.showSettings == true {
+                appState?.showSettings = false
+            }
+        } else if win === diagramWindow {
+            diagramWindow = nil
+            if appState?.showExpandedDiagram == true {
+                appState?.showExpandedDiagram = false
+            }
+        }
+    }
+
+    private func updateStatusBarVisibility(stealth: Bool) {
+        if stealth {
+            teardownStatusBar()
+        } else if statusBarItem == nil {
+            setupStatusBar()
+        }
+    }
+
+    private func teardownStatusBar() {
+        if let item = statusBarItem {
+            NSStatusBar.system.removeStatusItem(item)
+            statusBarItem = nil
+        }
     }
 
     // MARK: - Keyboard Shortcuts
@@ -154,14 +582,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             toggleMinimize: { [weak self] in
                 self?.stealthWindowManager?.toggleMinimize()
             },
+            toggleExtremeStealth: { [weak self] in
+                guard let self, let state = self.appState else { return }
+                state.settings.extremeStealthEnabled.toggle()
+                self.stealthWindowManager?.setExtremeStealth(state.settings.extremeStealthEnabled)
+            },
+            focusInput: {
+                NotificationCenter.default.post(name: .soloScreenFocusInput, object: nil)
+            },
+            showShortcuts: {
+                NotificationCenter.default.post(name: .soloScreenShowShortcuts, object: nil)
+            },
             captureScreenshot: { [weak self] in
+                // Capture and attach to the pending strip — the user sends
+                // manually (possibly with multiple screenshots + a prompt).
                 self?.appState?.captureScreenshot()
             },
             toggleMicRecording: { [weak self] in
                 self?.appState?.toggleMicRecording()
             },
+            toggleTranscription: { [weak self] in
+                self?.appState?.toggleTranscription()
+            },
+            attachFile: { [weak self] in
+                self?.appState?.showFilePicker = true
+                self?.stealthWindowManager?.show()
+            },
+            scrollUp: {
+                NotificationCenter.default.post(name: .soloScreenScrollUp, object: nil)
+            },
+            scrollDown: {
+                NotificationCenter.default.post(name: .soloScreenScrollDown, object: nil)
+            },
             cancelStreaming: { [weak self] in
                 self?.appState?.cancelStreaming()
+            },
+            requestLiveHelp: { [weak self] in
+                self?.appState?.requestLiveHelp()
+            },
+            clearChat: { [weak self] in
+                self?.appState?.clearCurrentChat()
+            },
+            showModelSelector: { [weak self] in
+                guard let self else { return }
+                self.appState?.settingsInitialTab = "AI Provider"
+                self.appState?.showSettings = true
+            },
+            opacityUp: { [weak self] in
+                self?.appState?.increaseOpacity()
+            },
+            opacityDown: { [weak self] in
+                self?.appState?.decreaseOpacity()
+            },
+            hideWindow: { [weak self] in
+                self?.stealthWindowManager?.hide()
+            },
+            toggleDiagram: { [weak self] in
+                self?.appState?.toggleExpandedDiagram()
+            },
+            expandDiagram: { [weak self] number in
+                self?.appState?.expandDiagram(number: number)
             }
         ))
     }

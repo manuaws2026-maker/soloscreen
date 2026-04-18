@@ -1,0 +1,168 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for Strava — let me break down the requirements.
+
+For the functional requirements, the core things we need: first, users should be able to start, pause, stop, and save their runs and rides. Second, while running or cycling, users should see live activity data — route on a map, distance, and elapsed time. Third, users should be able to view their own completed activities and browse their friends' activities.
+
+For non-functional requirements — high availability is critical, we'd favor availability over consistency here since a brief delay in syncing is fine but the app going down mid-run is not. The app needs to work offline in remote areas with no connectivity. We need accurate and responsive local stats during an activity. And we should scale to support 10 million concurrent activities, assuming about 100 million DAU.
+
+Below the line: friend management, activity comments and likes, route recommendations, and detailed analytics.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Users can start, pause, stop, and save runs and rides
+2. Users can view live activity data (route, distance, time) during an activity
+3. Users can view their own completed activities and friends' activities
+
+**Non-Functional Requirements:**
+- High availability (availability >> consistency)
+- Offline support: app must function in remote areas without network connectivity
+- Accurate, low-latency local statistics during activities
+- Scale to 10M concurrent activities (~100M DAU)
+
+**Below the Line (Out of Scope):**
+- Friend management (add/remove)
+- Activity comments and likes
+- Route recommendations
+- Detailed analytics and training plans[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Let me define the core entities. We've got four main ones.
+
+A User represents someone using the app — their profile and settings. An Activity is an individual run or ride — it has an activity type, start and end time, GPS route data, distance, and duration. A Route is a collection of GPS coordinates recorded during the activity — could be its own entity or just a field on Activity, but I'll keep it separate since it can get large. And Friend represents a connection between users for sharing activities — we're not building friend management, but we need the concept for the sharing feature.[/SAY]
+[DETAIL]- **User** : Represents a person using the app. Contains profile information and settings.
+- **Activity** : Represents an individual running or cycling activity. Includes activity type (run/ride), start time, end time, route data (GPS coordinates), distance, and duration.
+- **Route** : A collection of GPS coordinates recorded during the activity (this could also just be a field on the Activity entity).
+- **Friend** : Represents a connection between users for sharing activities (note: friend management is out of scope, but the concept is necessary for sharing).[/DETAIL]
+--- SECTION: API Design
+[SAY]Here are the key endpoints. First, POST to /activities to create a new activity — just takes the type, run or ride. Then PATCH to /activities/:activityId to update the state — started, paused, or completed.
+
+For tracking location data during the activity, POST to /activities/:activityId/routes with a GPS coordinate. I'm using PATCH for state updates because we're only modifying a subset of fields — minor efficiency win over PUT.
+
+When an activity completes, we use the same PATCH endpoint with state "COMPLETE." For viewing activities, GET /activities with query params for mode — either your own or your friends' — plus pagination. And GET /activities/:activityId for the full detail view with the route map.[/SAY]
+[DETAIL]We'll define the APIs that allow the mobile app to interact with the backend services.
+Our goal is to simply go one-by-one through the core requirements and define the APIs that are necessary to satisfy them. Usually, these map 1:1 to the functional requirements, but there are times when multiple endpoints are needed to satisfy an individual functional requirement or where a single endpoint meets the needs of multiple functional requirements (as is the case with our activity state update endpoint below).
+First, we'll define an endpoint that can be used to create a new activity.
+Next, we'll add an endpoint that can be used to update the state of that activity.
+We use PATCH here because we only want to update a subset of the activity's fields. Whereas PUT would require sending the entire resource, with PATCH we only send the fields that are being updated -- a, albeit minor, improvement in efficiency.In your interview, PUT and PATCH are functionally equivalent. However, you will come across some interviewers who areRESTfulAPI hawks and will argue this point with you, so it's best to be prepared.
+When it comes to tracking activity data, we'll add a POST endpoint that is used to update the activity's route and distance.
+When it comes to sharing activities with friends, we'll say that this happens automatically when an activity is saved, so instead of a endpoint for sharing, we can just update our existing endpoint that updates the activity state to include a "COMPLETE" state.
+To view activities, we'll need a list view that shows either our activities or the activities of our friends. This list will just show basic information about the activity, such as the distance, duration, and date.
+ThePartial<Activity>type simply means that we are returning a subset of the activity fields. This is done to limit the amount of data we send over the network. This notation is what I use and is derived from TypeScript, but you can use whatever notation you'd like. This is just a personal preference.
+When we click on an activity, we'll want to see more details about like the maps with the route and any additional metrics or details (that are out of scope for this question).
+
+```
+// Create a new activity
+POST /activities -> Activity
+{
+ type: "RUN" | "RIDE"
+}
+```
+
+```
+// Update the state of an activity
+PATCH /activities/:activityId -> Activity
+{
+ state: "STARTED" | "PAUSED"
+}
+```
+
+```
+// Add a new location to the activity's route
+POST /activities/:activityId/routes -> Activity
+{
+ location: GPSCoordinate,
+}
+```
+
+```
+// Mark an activity as complete using the same endpoint we use to update the activity state
+PATCH /activities/:activityId -> Activity
+{
+ state: "COMPLETE"
+}
+```
+
+```
+// Get a list of activities for a user
+GET /activities?mode={USER|FRIENDS}&page={page}&pageSize={pageSize} -> Partial<Activity>[]
+```
+
+```
+// Get an activity by id
+GET /activities/:activityId -> Activity
+```[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, I'd use PostgreSQL for the core entities — User, Activity, Friend — since we need consistency for things like activity state transitions. For Route data, given that a single activity could have thousands of GPS points, I'd store that in a more scalable way, possibly in a time-series optimized store or just as a JSON blob in S3, with a reference in Postgres.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through the architecture one requirement at a time.
+
+For starting and managing activities, the client hits our API Gateway through a load balancer, which routes to an Activity Service. That service creates or updates activity records in the database.
+
+For tracking live data during a run, the app records GPS coordinates and sends them to the Activity Service, which stores the route data. The app also computes distance locally using the Haversine formula so the user sees real-time stats without network dependency.
+
+For viewing completed activities, we query the database filtering on state "COMPLETE" and the mode — either the user's own activities or their friends'. Simple WHERE clause with pagination.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> LB[Load Balancer]
+    LB --> API[API Gateway]
+    API --> Activity[Activity Service]
+    API --> GooglePlay[Google Play Service]
+    API --> TheActivity[The Activity Service]
+    API --> GoogleLocation[Google Location Service]
+    API --> InLocation[In Location Service]
+    InLocation --> Database[(Database)]
+```
+
+**Data Flow:**
+1. 1) Users should be able to start, pause, stop, and save their runs and rides.
+2. 2) While running or cycling, users should be able to view activity data, including route, distance, and time.
+3. 3) Users should be able to view details about their own completed activities as well as the activities of their friends.[/DETAIL]
+--- SECTION: Deep Dive: Support tracking activities while offline?
+[SAY]This is the key insight that reshapes the entire design. Athletes frequently work out in remote areas with no cell service, but they still need to track their runs.
+
+The realization is — as long as we don't need real-time sharing during an activity, we can record all activity data locally on the device and only sync to the server when the activity completes and the user is back online.
+
+The phone has GPS, accelerometer, and a clock — everything we need to track the activity locally. We store GPS coordinates, compute distance with the Haversine formula, and track elapsed time all on-device. When the user finishes and has connectivity, we batch-upload the entire activity.
+
+This actually solves multiple problems at once: offline support obviously, but it also massively reduces our backend load since we're not getting location pings every few seconds from millions of active users. Instead we get one bulk upload per completed activity.[/SAY]
+[DETAIL]**Problem:** How can we support tracking activities while offline?[/DETAIL]
+--- SECTION: Deep Dive: Scale to support 10 million concurrent activities?
+[SAY]Now that we track activities locally, scaling the backend got much easier. We cut the number of requests by roughly 100x since we only send data once a run completes, not every few seconds during it.
+
+But we still have potential bottlenecks. With 100 million DAU each doing an activity per day, that's 100 million new activities daily. Over a year, that's around 36 billion records. So we need to think about database sharding — I'd partition by userId since activity queries are almost always scoped to a single user or their friends.
+
+For the Activity Service itself, it's stateless so we scale horizontally behind a load balancer. And for the activity list views, we can add a Redis cache layer for frequently accessed feeds to reduce database load.[/SAY]
+[DETAIL]**Problem:** How can we scale to support 10 million concurrent activities?[/DETAIL]
+--- SECTION: Deep Dive: Support realtime sharing of activities with friends?
+[SAY]Okay so a common follow-up is — what if friends want to watch your run in real time, seeing your route and stats update live?
+
+This changes things because now we need to send location updates to the server during the activity. We'd still keep the local tracking for the user's own display, but we'd also send updates to the server every 2-5 seconds.
+
+The server receives these updates, persists them, and broadcasts to friends who are watching. For the broadcast, I'd use WebSockets — each friend watching opens a WebSocket connection, and we push updates through it. We can use a pub/sub system like Redis Pub/Sub to fan out updates from the activity to all watching friends.
+
+This brings the design closer to something like a live streaming system. The trade-off is significantly more backend load compared to our offline-first approach, but only for users who opt into live sharing.[/SAY]
+[DETAIL]**Problem:** How can we support realtime sharing of activities with friends?[/DETAIL]
+--- SECTION: Deep Dive: Expose a leaderboard of top athletes?
+[SAY]Another natural extension — a leaderboard showing top athletes by activity type and distance, filterable by region.
+
+I'd use Redis Sorted Sets for this. Each user's total distance is their score, and the sorted set gives us efficient top-N queries. When a new activity is logged, we increment the user's score with ZINCRBY.
+
+For filtering by country or time range, we create separate sorted sets — like "leaderboard:run:USA" and "leaderboard:ride:global." When an activity completes, we update both the global and regional leaderboards. Querying the top 100 is O(log N + 100), which is blazing fast.
+
+The alternative would be periodic aggregation from the database, which works but introduces staleness. Redis gives us real-time results with minimal overhead.[/SAY]
+[DETAIL]**Problem:** How can we expose a leaderboard of top athletes?
+
+**Solution:** Great Solution: Real-time Leaderboard with Redis
+ApproachFor a more scalable and real-time solution, we can leverageRedis, an in-memory data structure store. We'll use Redis Sorted Sets to maintain leaderboards, with user IDs as members and their total distances as scores. When a new activity is logged, we increment the user's score in the sorted set. To query the leaderboard, we simply retrieve the top N members from the sorted set, which Redis can do extremely efficiently.What happens when we want to filter by country or time range?To handle filtering by country or time range, we can extend our Redis-based approach:For country filtering:We can create separate sorted sets for each country, e.g., "leaderboard:run:USA", "leaderboard:run:Canada", etc.When an activity is logged, we update both the global leaderboard and the country-specific leaderboard.To query a country-specific leaderboard, we simply use the appropriate country-specific sorted set.# Add an activity to the leaderboard (increment user's total distance)
+redis.zincrby(f"l...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Naive Approach
+- (Good) Good Solution: Periodic Aggregation[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. The biggest one is our offline-first design — we traded real-time server visibility of in-progress activities for massive backend simplification and true offline support. For the leaderboard, we chose Redis Sorted Sets over periodic database aggregation — more infrastructure to manage, but we get real-time rankings without expensive queries. And if we add live sharing, we're adding significant backend complexity with WebSockets and pub/sub, but it's opt-in per user so we only pay that cost when needed.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Why |
+| --- | --- | --- | --- |
+| How can we expose a leaderboard of top athletes? | Great Solution: Real-time Leaderboard with Redis | Good Solution: Periodic Aggregation | Better scalability and reliability |[/DETAIL]
+[/SYSDESIGN]

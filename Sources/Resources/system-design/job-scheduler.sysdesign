@@ -1,0 +1,133 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for a job scheduler — let me think about what we need here.
+
+For the functional requirements, the core things: first, users should be able to schedule jobs to run immediately, at a specific future time, or on a recurring schedule via cron expressions. Second, users should be able to monitor the status of their jobs — whether they're pending, running, completed, or failed.
+
+For non-functional requirements — precision is important, jobs should execute within 2 seconds of their scheduled time. We need at-least-once execution — it's better to run a job twice than to miss it entirely. And we need to scale to 10,000 jobs per second.
+
+Below the line: job prioritization, complex dependency chains between jobs, and a visual dashboard for job management.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Users can schedule jobs for immediate, future, or recurring (cron) execution
+2. Users can monitor job status (pending, in-progress, completed, failed)
+
+**Non-Functional Requirements:**
+- Precision: execute jobs within 2 seconds of scheduled time
+- At-least-once execution: never silently drop a job
+- Scalability: handle 10,000 jobs per second
+- Fault tolerance: recover from worker failures without losing jobs
+
+**Below the Line (Out of Scope):**
+- Job prioritization and complex dependency chains
+- Visual dashboard for job management
+- Multi-region deployment[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Let me define the core entities. We've got four.
+
+A Task represents a reusable unit of work — like "send email" or "generate report." A Job is a specific instance of a task to be executed at a given time with given parameters. A Schedule defines when a job should run — either a cron expression for recurring jobs or a specific datetime for one-off jobs. And a User is whoever schedules jobs and checks on their status.[/SAY]
+[DETAIL]- **Task** : Represents a task to be executed.
+- **Job** : Represents an instance of a task to be executed at a given time with a given set of parameters.
+- **Schedule** : Represents a schedule for when a job should be executed, either a CRON expression or a specific DateTime.
+- **User** : Represents a user who can schedule jobs and view the status of their jobs.[/DETAIL]
+--- SECTION: API Design
+[SAY]Here are the key endpoints. POST /jobs to create a new job — takes a task_id, a schedule which could be a cron expression or a specific datetime, and the parameters needed to run the task.
+
+Then GET /jobs with filters for user, status, and time range to query job status. The user_id would come from the session token in production, but the status and time range filters are useful for monitoring.
+
+Pretty clean and simple — the complexity in a job scheduler is in the execution engine, not the API.[/SAY]
+[DETAIL]Your goal is to simply go one-by-one through the core requirements and define the APIs that are necessary to satisfy them. Usually, these map 1:1 to the functional requirements, but there are times when multiple endpoints are needed to satisfy an individual functional requirement.
+First, let's create a job:
+Next, let's query the status of our jobs:
+
+```
+POST /jobs
+{
+ "task_id": "send_email",
+ "schedule": "0 10 * * *",
+ "parameters": {
+ "to": "john@example.com",
+ "subject": "Daily Report"
+ }
+}
+```
+
+```
+GET /jobs?user_id={user_id}&status={status}&start_time={start_time}&end_time={end_time} -> Job[]
+```[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, PostgreSQL for the core tables — Tasks, Jobs, Schedules, and an Executions table that tracks each run attempt with status and timestamps. We need ACID transactions here because we can't have two workers picking up the same job. I'd also consider Redis for the job queue layer, but I'll get into that in the deep dives.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through this one requirement at a time.
+
+For scheduling jobs, the user hits the API server which validates the request and stores the job in Postgres. For recurring jobs, a Scheduler Service evaluates cron expressions and creates individual job instances as they come due.
+
+For monitoring, the API server queries the Executions table which tracks every job run — status, start time, end time, any error messages. We update this table as workers pick up and complete jobs.
+
+The core loop is: Scheduler Service identifies jobs that are due, hands them to workers for execution, and workers report back status. The question is how we make that handoff precise and reliable — that's what the deep dives will cover.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> LB[Load Balancer]
+    LB --> API[API Gateway]
+    API --> Core[Core Service]
+    Core --> Database[(Database)]
+    Core --> PostgreSQL[(PostgreSQL)]
+```
+
+**Data Flow:**
+1. 1) Users should be able to schedule jobs to be executed immediately, at a future date, or on a recurring schedule
+2. 2) Users should be able monitor the status of their jobs.[/DETAIL]
+--- SECTION: Deep Dive: Ensure the system executes jobs within 2s of their schedu...
+[SAY]So the problem with our current design is that we're polling the database to find jobs that are due. If we poll every 2 minutes, a job could run up to 2 minutes late. And polling every 2 seconds would hammer the database.
+
+I'd use Amazon SQS with its delivery delay feature. When we schedule a job, we send a message to SQS with a delay matching the time until execution. SQS holds the message invisibly until it's time, then delivers it to a worker. For a job due in 10 seconds, we set DelaySeconds to 10.
+
+The nice thing is SQS handles all the timing infrastructure — no polling needed. Visibility timeouts handle worker failures automatically, and dead-letter queues catch jobs that fail repeatedly. The one limitation is DelaySeconds caps at 15 minutes, so for jobs further out, the Scheduler Service would queue them closer to their execution time.
+
+For recurring jobs, after each execution the Scheduler Service calculates the next run time from the cron expression and enqueues a new message with the appropriate delay.[/SAY]
+[DETAIL]**Problem:** How can we ensure the system executes jobs within 2s of their scheduled time?
+
+**Solution:** Great Solution: Amazon SQS
+ApproachAmazon SQS provides a fully managed queue service with native support for delayed message delivery. When scheduling a job, we simply send a message to SQS with a delay value (called a "SQS Delivery Delay"), and SQS handles the rest.For example, if we want to schedule a job to run in 10 seconds, we can send a message to SQS with a delay of 10 seconds. SQS will then deliver the message to our worker after the delay. Easy as that!This eliminates the need for managing infrastructure while providing all the features we need out of the box. The delivery delay feature ensures messages remain invisible until their scheduled execution time (note:DelaySecondsis capped at 15 minutes, so this works within our 5-minute window), while visibility timeouts handle worker failures after messages are consumed. Dead-letter queues capture failed jobs for investigation. High availability is guaranteed across multiple availability zones, and the service scales automatically to handle our load.
+
+**Alternatives considered:**
+- (Good) Good Solution: Redis Sorted Sets
+- (Good) Good Solution: RabbitMQ[/DETAIL]
+--- SECTION: Deep Dive: Ensure the system is scalable to support up to 10k jobs p...
+[SAY]Okay so 10k jobs per second — let me work through the bottlenecks left to right.
+
+Starting with job creation. If most jobs are one-time, we could see up to 10k creates per second hitting Postgres. That's a lot of writes. I'd horizontally scale the API servers and potentially shard the Jobs table by user_id.
+
+For the queue, SQS scales automatically — it can handle well beyond 10k messages per second without any tuning on our end.
+
+For the workers, this is where we need the most scaling. 10k jobs per second means we need enough workers to process them. If each job takes 100ms on average, we need about 1,000 workers running concurrently. We'd use an auto-scaling group that scales based on the SQS queue depth metric — if the queue starts growing, we add workers.
+
+The database for status tracking could also become a bottleneck with 10k writes per second for execution updates. I'd batch these writes or use a write-optimized store for execution logs.[/SAY]
+[DETAIL]**Problem:** How can we ensure the system is scalable to support up to 10k jobs per second?[/DETAIL]
+--- SECTION: Deep Dive: Ensure at-least-once execution of jobs?
+[SAY]At-least-once means if a worker fails mid-job, the job gets retried. There are two failure modes: visible failures where the task throws an error, and invisible failures where the worker process crashes or hangs.
+
+For visible failures, the worker catches the error and re-queues the message. We track retry count and after, say, 3 attempts, move it to a dead-letter queue.
+
+For invisible failures, SQS handles this with visibility timeouts. When a worker pulls a message, it becomes invisible for a configurable period. If the worker doesn't delete the message — because it crashed — the message reappears and another worker picks it up.
+
+Now, at-least-once means jobs might run more than once. So we need idempotency. The key is designing jobs to be naturally idempotent — instead of "increment counter," the job should be "set counter to X." Each job gets a unique execution ID that downstream services can use to deduplicate. This way, duplicate executions are harmless.[/SAY]
+[DETAIL]**Problem:** How can we ensure at-least-once execution of jobs?
+
+**Solution:** Great Solution: Idempotent Job Design
+ApproachDesign jobs to be naturally idempotent by using idempotency keys and conditional operations. For example, instead of "increment counter", the job would be "set counter to X". Instead of "send welcome email", we'd first check if the welcome email flag is already set in the user's profile. Each job execution includes a unique identifier that downstream services can use to deduplicate requests.This is the most robust approach, essentially offloading idempotency concerns to the task's implementation.
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Health Check Endpoints
+- (Good) Good Solution: Job Leasing
+- (Bad) Bad Solution: No Idempotency Controls
+- (Good) Good Solution: Deduplication Table[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For execution precision, we chose SQS over Redis Sorted Sets or RabbitMQ — SQS gives us delay delivery, visibility timeouts, and dead-letter queues as managed infrastructure, but we're locked into AWS. For at-least-once execution, we went with idempotent job design — this pushes complexity to the task implementors, but it's the most robust approach since no amount of infrastructure can guarantee exactly-once in a distributed system. The trade-off is that every job author needs to think about idempotency, but that's the right responsibility boundary.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Why |
+| --- | --- | --- | --- |
+| How can we ensure the system executes jobs within | Great Solution: Amazon SQS | Good Solution: RabbitMQ | Better scalability and reliability |
+| How can we ensure at-least-once execution of jobs? | Great Solution: Idempotent Job Design | Good Solution: Deduplication Table | Better scalability and reliability |[/DETAIL]
+[/SYSDESIGN]

@@ -1,0 +1,152 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for a LeetCode-style coding platform — let me think through the requirements.
+
+For the functional requirements, the core things: first, users need to browse and view coding problems. Second, users should be able to write code in the browser and submit solutions. Third, the system runs their code against test cases and returns results — pass, fail, runtime error, time limit exceeded. And fourth, during competitions, users should see a live leaderboard.
+
+For non-functional requirements — availability over consistency, since it's fine if leaderboard updates are slightly delayed but the platform going down during a contest would be really bad. Security and isolation when running user-submitted code is critical — we can't let someone's infinite loop crash our servers. Submission results should come back within 5 seconds. And we need to handle competition spikes with up to 100,000 concurrent users.
+
+Below the line: fault tolerance, payment processing for premium features, CI/CD, and backups.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Users can browse and view coding problems with descriptions and code stubs
+2. Users can write and submit code solutions in multiple languages
+3. System executes user code against test cases and returns results within 5 seconds
+4. Users can view a live leaderboard during competitions
+
+**Non-Functional Requirements:**
+- Availability over consistency (availability >> consistency)
+- Isolation and security: user code runs sandboxed, cannot affect other users or the platform
+- Low latency: submission results returned within 5 seconds
+- Scale to support competitions with 100,000 concurrent users
+
+**Below the Line (Out of Scope):**
+- Fault tolerance and disaster recovery
+- Payment processing for premium subscriptions
+- CI/CD pipelines
+- Regular backups[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Let me define the core entities. We've got three main ones.
+
+A Problem stores the problem statement, test cases, expected outputs, and code stubs for each supported language. A Submission tracks a user's code submission — the code itself, the language, and the result of running it against test cases. And a Leaderboard entity tracks rankings for competitions — user scores, solve times, that kind of thing.[/SAY]
+[DETAIL]- **Problem** : This entity will store the problem statement, test cases, and the expected output.
+- **Submission** : This entity will store the user's code submission and the result of running the code against the test cases.
+- **Leaderboard** : This entity will store the leaderboard for competitions.[/DETAIL]
+--- SECTION: API Design
+[SAY]Here are the key endpoints. GET /problems with pagination for browsing the problem list — we return partial data here, just title, difficulty, and tags, not the full problem statement.
+
+GET /problems/:id with a language query param to get the full problem and a code stub in the user's preferred language. POST /problems/:id/submit with the code and language to submit a solution — userId comes from the session token, not the request body. And GET /leaderboard/:competitionId with pagination for the live competition rankings.
+
+One important thing — the submit endpoint won't return results synchronously once we add the queue in the deep dive. We'd switch to returning a submissionId and having the client poll for results.[/SAY]
+[DETAIL]When defining the API, we can usually just go one-by-one through our functional requirements and make sure that we have (at least) one endpoint to satisfy each requirement. This is a good way to ensure that we're not missing anything.
+Starting with viewing a list of problems, we'll have a simple GET endpoint that returns a list. I've added some basic pagination as well since we have far more problems than should be returned in a single request or rendered on a single page.
+ThePartialhere is taken from TypeScript and indicates that we're only returning a subset of theProblementity. In reality, we only need the problem title, id, level, and maybe a tags or category field but no need to return the entire problem statement or code stubs here. How you short hand this is not important so long as you are clear with your interviewer.
+Next, we'll need an endpoint to view a specific problem. This will be another GET endpoint that takes a problem ID (which we got when a user clicked on a problem from the problem list) and returns the full problem statement and code stub.
+We've added a query parameter for language which can default to any language, say `python` if not provided. This will allow us to return the code stub in the user's preferred language.
+Then, we'll need an endpoint to submit a solution to a problem. This will be a POST endpoint that takes a problem ID and the user's code submission and returns the result of running the code against the test cases.
+Finally, we'll need an endpoint to view a live leaderboard for competitions. This will be a GET endpoint that returns the ranked list of users based on their performance in the competition.
+Always consider the security implications of your API. I regularly see candidates passing in data likeuserIdortimestampsin the body or query parameters. This is a red flag as it shows a lack of understanding of security best practices. Remember that you can't trust any data sent from the client as it can be easily manipulated. User data should always be passed in the session or JWT, while timestamps should be generated by the server.
+
+```
+GET /problems?page=1&limit=100 -> Partial<Problem>[]
+```
+
+```
+GET /problems/:id?language={language} -> Problem
+```
+
+```
+POST /problems/:id/submit -> Submission
+{
+ code: string,
+ language: string
+}
+
+- userId not passed into the API, we can assume the user is authenticated and the userId is stored in the session
+```
+
+```
+GET /leaderboard/:competitionId?page=1&limit=100 -> Leaderboard
+```[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, PostgreSQL for Problems and Submissions — we need consistency and relational queries, especially for joining submissions with problems and users. For the leaderboard, I'd add Redis as a specialized store since we need fast ranked queries during competitions. I'll go deeper on that in the deep dives.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through this one requirement at a time.
+
+For browsing problems, it's straightforward — the client hits the API server, which queries Postgres and returns the problem list or a specific problem.
+
+For submitting solutions, this is where it gets interesting. When a user submits code, we need to run it in an isolated container. The API server takes the submission, spins up a sandboxed container with the user's code and the test cases, runs it, and returns the results. The container is ephemeral — created for each submission and destroyed after.
+
+For the leaderboard, the simplest approach is to query the submissions table grouped by user, ordered by problems solved. That works initially but won't scale for live competitions — we'll improve this in the deep dives.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> LB[Load Balancer]
+    LB --> API[API Gateway]
+    API --> AContainer[A Container Service]
+    AContainer --> DynamoDB[(DynamoDB)]
+    AContainer --> Database[(Database)]
+```
+
+**Data Flow:**
+1. 1) Users should be able to view a list of coding problems
+2. 2) Users should be able to view a given problem and code a solution
+3. 3) Users should be able to submit their solution and get instant feedback
+4. 4) Users should be able to view a live leaderboard for competitions[/DETAIL]
+--- SECTION: Deep Dive: How will the system support isolation and security when r...
+[SAY]So running user code in isolated containers is a good start, but we need to harden those containers further.
+
+First, read-only filesystem — mount the code directory as read-only and write output to a temporary directory that gets deleted shortly after completion. This prevents users from writing malicious files.
+
+Second, CPU and memory bounds — we set strict limits on the container. If a user writes an infinite loop or allocates gigabytes of memory, the container gets killed before it affects anything else. This is just Docker resource limits, straightforward to configure.
+
+Third, network isolation — containers shouldn't have network access. No calling external APIs, no exfiltrating data. And we'd set a strict execution timeout — say 10 seconds — after which the container is forcefully terminated. Combined, these measures mean user code is truly sandboxed.[/SAY]
+[DETAIL]**Problem:** How will the system support isolation and security when running user code?[/DETAIL]
+--- SECTION: Deep Dive: How would you make fetching the leaderboard more efficient?
+[SAY]Our initial approach of querying the submissions table every time someone requests the leaderboard is way too slow for a live competition with 100k users hitting refresh.
+
+I'd use Redis Sorted Sets for this. When a submission passes all test cases, we update the user's score in a Redis sorted set keyed by competition ID. The score could be the number of problems solved, or a composite of problems solved and total time. Querying the top N users is O(log N + N) in Redis — effectively instant.
+
+Clients poll the server every 5 seconds for leaderboard updates. The server reads directly from Redis, no database queries needed. This handles the load easily.
+
+WebSockets would be overkill here — with a 5-second acceptable delay and at most 100k users, polling against Redis is simple and sufficient. We could even do progressive polling, more frequent in the last few minutes of a contest.[/SAY]
+[DETAIL]**Problem:** How would you make fetching the leaderboard more efficient?
+
+**Solution:** Great Solution: Redis Sorted Set with Periodic Polling
+ApproachThis solution uses Redis sorted sets to maintain a real-time leaderboard while storing submission results in the main database. When a submission is processed, both the database and the Redis sorted set are updated. Clients poll the server every 5 seconds for leaderboard updates, and the server returns the top N users from the Redis sorted set which is wicked fast and requires no expensive database queries.Redis sorted sets are an in-memory data structure that allows us to efficiently store and retrieve data based on a score. This is perfect for our use case, as we can update the leaderboard by adding or removing users and their scores, and then retrieve the top N users with the highest scores.The Redis sorted set uses a key format likecompetition:leaderboard:{competitionId}, with the score being the user's total score or solve time, and the value being the userId. We'd implement an API endpoint likeGET /competitions/:competitionId/leaderboard?top=100. When processing a submiss...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Polling with Database Queries
+- (Good) Good Solution: Caching with Periodic Updates[/DETAIL]
+--- SECTION: Deep Dive: How would the system scale to support competitions with 1...
+[SAY]The main concern with 100k concurrent users during a competition is a spike in code submissions that could overwhelm our container infrastructure. The API server scales fine horizontally, but spinning up containers is CPU-intensive.
+
+I'd put a message queue — SQS — between the API server and the execution containers. When a user submits code, it goes into the queue. Worker nodes pull submissions and spin up containers to execute them. This gives us a buffer during peak load and natural backpressure.
+
+The trade-off is that the system becomes asynchronous. The submit endpoint now returns a submission ID immediately, and the client polls for results. But we already said 5 seconds is acceptable, so this works well. And the queue gives us automatic retries if a container crashes mid-execution — the message just becomes visible again.
+
+We auto-scale the worker pool based on queue depth. If the queue starts backing up, we spin up more workers.[/SAY]
+[DETAIL]**Problem:** How would the system scale to support competitions with 100,000 users?
+
+**Solution:** Great Solution: Horizontal Scaling w/ Queue
+ApproachWe can take the same exact approach as above but add a queue between the API server and the containers. This will allow us to buffer submissions during peak times and ensure that we don't overwhelm the containers. We can use a managed queue service likeSQSto handle this for us.When a user submits their code, the API server will add the submission to the queue and the containers will pull submissions off the queue as they become available. This will help us manage the load on the containers and ensure that we don't lose any submissions during peak times.Once our worker gets the results, it will notify the App Server so it can update both the database and the cache simultaneously.One important thing to note is that the introduction of the queue has made the system asynchronous. This means that the API server will no longer be able to return the results of the submission immediately. Instead, the user will need to poll the server for the results. We introduce a new endpoint, sayGE...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Vertical Scaling[/DETAIL]
+--- SECTION: Deep Dive: How would the system handle running test cases?
+[SAY]So a practical question — how do we actually run test cases against user code in any language?
+
+We definitely don't want to write test cases per language per problem. That would be a maintenance nightmare. Instead, we write one set of test cases per problem with serialized inputs and expected outputs — basically JSON.
+
+Then for each supported language, we have a test harness — a small wrapper that knows how to deserialize the JSON inputs, call the user's function, and compare the output to the expected result. The harness is language-specific but the test data is universal.
+
+So the execution flow is: container starts, loads the test harness for the submitted language, loads the universal test cases, deserializes inputs, calls the user's function, serializes the output, and compares. This keeps test authoring simple and language support modular — adding a new language just means writing one new harness.[/SAY]
+[DETAIL]**Problem:** How would the system handle running test cases?[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For the leaderboard, we chose Redis Sorted Sets with polling over WebSockets — simpler infrastructure, and the 5-second polling interval is perfectly acceptable for our use case. For handling competition scale, we went with SQS between the API server and execution containers — this made the system async, but gave us buffering, retries, and auto-scaling. The queue adds a bit of latency but keeps us well within the 5-second target. And for code execution, containerized sandboxing adds overhead per submission, but it's the only way to safely run untrusted code.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Why |
+| --- | --- | --- | --- |
+| How would you make fetching the leaderboard more e | Great Solution: Redis Sorted Set with Periodic Polling | Good Solution: Caching with Periodic Updates | Better scalability and reliability |
+| How would the system scale to support competitions | Great Solution: Horizontal Scaling w/ Queue | Bad Solution: Vertical Scaling | Better scalability and reliability |[/DETAIL]
+[/SYSDESIGN]

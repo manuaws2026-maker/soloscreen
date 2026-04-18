@@ -1,0 +1,148 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for a distributed rate limiter, let me start with the functional requirements — the core things we need.
+
+First, the system needs to check incoming requests against configurable rate limiting rules and decide whether to allow or reject them. Second, when limits are exceeded, we return HTTP 429 with helpful headers like Retry-After. Third, we need to support multiple rule types — per-user, per-IP, per-API-key, and per-endpoint limits.
+
+For non-functional requirements — minimal latency overhead, under 10 milliseconds per check. High availability is critical because if the rate limiter goes down, we either lose protection or block all traffic. Eventual consistency is acceptable — slight delays in limit enforcement across nodes are fine. And we need to handle 1M requests per second across 100M daily active users.
+
+Below the line for now: strong consistency across all nodes, DDoS mitigation at the network layer, and billing integration.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Check incoming requests against rate limiting rules, allow or reject
+2. Return HTTP 429 with Retry-After headers when limits exceeded
+3. Support multiple rule types: per-user, per-IP, per-API-key, per-endpoint limits
+
+**Non-Functional Requirements:**
+- Minimal latency overhead: < 10ms per request check
+- High availability with eventual consistency acceptable
+- Handle 1M requests/second across 100M daily active users
+
+**Below the Line (Out of Scope):**
+- Strong consistency guarantees across all nodes
+- DDoS mitigation at the network layer
+- Billing or monetization integration[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Let me define the core entities. We've got three main ones.
+
+Rules are the rate limiting policies — they define limits like "authenticated users get 1000 requests per hour" or "the search endpoint allows 10 requests per minute per IP." Each rule specifies the limit, time window, and which clients it applies to.
+
+Clients are the entities being rate limited — could be a user ID, an IP address, or an API key. Each client has rate limiting state that tracks current usage against the applicable rules.
+
+And Requests are the incoming API calls we need to evaluate. Each one carries context like client identity, the endpoint being accessed, and a timestamp. When a request arrives, we identify the client, look up applicable rules, and decide allow or deny.[/SAY]
+[DETAIL]- While rate limiters might seem like simple infrastructure components, they actually involve several important entities that we need to model properly:
+- **Rules** : The rate limiting policies that define limits for different scenarios. Each rule specifies parameters like requests per time window, which clients it applies to, and what endpoints it covers. For example: "authenticated users get 1000 requests/hour" or "the search API allows 10 requests/minute per IP."
+- **Clients** : The entities being rate limited - this could be users (identified by user ID), IP addresses, API keys, or combinations thereof. Each client has associated rate limiting state that tracks their current usage against applicable rules.
+- **Requests** : The incoming API requests that need to be evaluated against rate limiting rules. Each request carries context like client identity, endpoint being accessed, and timestamp that determines which rules apply and how to track usage.
+- These entities work together: when a **Request** arrives, we identify the **Client** , look up applicable **Rules** , check current usage against those rules, and decide whether to allow or deny the request. The interaction between these entities powers our rate limiter.[/DETAIL]
+--- SECTION: API Design
+[SAY]Before we define endpoints, there are two key decisions to make: where does the rate limiter live, and how do we identify clients?
+
+For placement, I'd go with the API Gateway approach. The rate limiter sits at the edge, integrated into the gateway. Every request hits it first, before reaching any backend service. Blocked requests never touch our application servers — like a bouncer at the door. The alternative of a dedicated service adds a network hop to every request, and in-process rate limiting doesn't give us a global view of traffic.
+
+For client identification — since we're at the gateway, we have access to HTTP headers, URL paths, and IP addresses. We'd use a combination: user ID from JWT tokens for authenticated users, IP address from X-Forwarded-For for anonymous traffic, and API keys from headers for developer access. In practice, we layer multiple rules — a user might be under their personal limit but their IP could still be blocked.[/SAY]
+[DETAIL]Before we can limit anyone, we need to make two key decisions. First, where should our rate limiter live in the architecture? This determines what information we have access to and how it integrates with the rest of our system. Second, how do we identify different clients so we can apply the right limits to the right users? These decisions are connected - your placement choice affects what client information you can easily access, and your identification strategy influences where the rate limiter makes sense to deploy.
+**Where should we place the rate limiter?**
+You have three main options here, each with different trade-offs:
+**Bad Solution: In-Process**
+ApproachEach application server or microservice has rate limiting built directly into the application code. When a request comes in, the server checks its local in-memory counters, updates them, and decides whether to allow or reject the request. This is really fast since everything happens in memory, no network calls, no external dependencies.In-Process Rate LimiterChallengesThe main problem is that each server only knows about its own traffic, not the global picture. Say you want to limit users to 100 requests per minute. If you have 5 application servers behind a load balancer, and requests get distributed evenly, each server might see 20 requests per minute from a user and think "that's fine, well under 100." But globally, the user is actually making 100 requests per minute across all servers.Even worse, if the load balancer changes how it routes traffic, or if one server gets more load than others, your limits become completely unpredictable. A user might get 100 requests through one server and 100 through another, for 200 total.This approach only works if you have a single application server or if you're okay with approximate limits that can be off by a factor equal to your server count.
+**Good Solution: Dedicated Service**
+ApproachThe rate limiter becomes its own microservice that sits between your clients and application servers. When a request arrives at an application server, the server first makes an API call to the rate limiting service: "Should I allow this request from user 12345?" The rate limiter checks its centralized counters and responds with either "yes, allow it" or "no, reject with 429."This architecture gives you a lot more flexibility. Your application servers can provide rich context when making the rate limit check like user subscription tier, account status, the specific API endpoint being called, or even complex business logic like "allow extra requests during Black Friday." You can also have different rate limiting services for different parts of your system, each tuned for specific needs.Most importantly, the rate limiting service maintains global state, so it can enforce precise limits across all your application servers. If you want 100 requests per minute globally, you get exactly that regardless of how many servers you have.Dedicated Service Rate LimiterChallengesThe biggest downside is latency. Every single request to your system now requires an additional network round trip before it can be processed. Even if the rate limiter is fast (say 10ms), that's still 10ms added to every request. At scale, this adds up.You've also introduced another point of failure. If your rate limiting service goes down, you need to decide: do you fail open (allow all requests through, risking overload) or fail closed (reject all requests, essentially taking your API offline)? Neither option is great.There's operational complexity too. You now have another service to deploy, monitor, scale, and maintain. The rate limiting service itself needs to be highly available, which means you need redundancy, health checks, and probably some form of datareplication.Finally, you need to handle network issues gracefully. What if the rate limiter is slow to respond? Do you wait (adding more latency) or timeout and make a guess? What if there are network partitions between your app servers and the rate limiter?
+**Great Solution: API Gateway/Load Balancer**
+ApproachThe rate limiter runs at the very edge of your system, integrated into your API gateway or load balancer. Every incoming request hits the rate limiter first, before it reaches any of your application servers. The rate limiter examines the request (checking IP address, user authentication headers, API keys), applies the appropriate limits, and either forwards the request downstream or immediately returns an HTTP 429 response.This is the most popular approach in production systems because it's conceptually simple and provides strong protection. Your application servers never see blocked requests, so they can focus entirely on processing legitimate traffic. For those who like analogies, the rate limiter acts like a bouncer at a club. Troublemakers get turned away at the door, not after they're already inside causing problems like was the case with our "Good" approach.API Gateway Rate LimiterChallengesThe main limitation is context. The rate limiter only has access to information available in the HTTP request itself - headers, URL, IP address, and basic authentication tokens. It can't see deeper business logic or user context that might live in your application layer. For example, you can't easily implement rules like "There's also the question of where to store the rate limiting state. The gateway needs fast access to counters and timestamps, which usually means an in-memory store like Redis. But now you have external dependencies and need to handle cases where Redis is slow or unavailable.We'll talk all about how to do this effectively in our deep dives!
+For our design, we'll go with the API Gateway approach. It's the most common pattern and gives us centralized control without adding extra network calls to every request. Now we can focus our attention to the next question, how do we identify clients?
+**How do we identify clients?**
+Since we chose the API Gateway approach, our rate limiter only has access to information in the HTTP request itself. This includes the request URL/path, all HTTP headers ( `Authorization` , `User-Agent` , `X-API-Key` , etc.), query parameters, and the client's IP address. While we can technically make external calls to databases or other services, it adds latency we want to avoid so we'll stick to the request itself.
+We first need to decide what makes a "client" unique. The key we use determines how limits get applied. We have three main options:
+This is the perfect time to ask your interviewer some questions. Are all users authenticated? Is this a developer API that requires API keys? etc.
+In practice, you'll probably want a combination. Maybe authenticated users get higher limits than anonymous IPs, and This is reflective of real systems that don't just enforce a global limit, but layer multiple rules. For example:
+Your rate limiter needs to check all applicable rules and enforce the most restrictive one. If Alice has used 50 of her 1000 requests but her IP has hit the 100 request limit, she gets blocked.
+**User ID** : Perfect for authenticated APIs. Each logged-in user gets their own rate limit allocation. This is typically present in the `Authorization` header as a JWT token.
+**IP Address** : Good for public APIs or when you don't have user accounts. But watch out for users behind NATs or corporate firewalls. The IP address is typically present in the `X-Forwarded-For` header.
+**API Key** : Common for developer APIs. Each key holder gets their own limits. Most typically, this is denoted in the `X-API-Key` header.
+**Per-user limits** : "Alice can make 1000 requests/hour"
+**Per-IP limits** : "This IP can make 100 requests/minute"
+**Global limits** : "Our API can handle 50,000 requests/second total"
+**Endpoint-specific limits** : "The search API is limited to 10 requests/minute, but profile updates are 100/minute"[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, everything performance-critical lives in Redis. Each rate limit counter is stored as a Redis hash — keyed by something like ratelimit:{userId}:{endpoint}:{window}. The hash holds the current count and window start time.
+
+Rules configuration could live in PostgreSQL for durability, but gets cached locally at each API gateway for fast lookups. The actual request-by-request counting has to be in Redis — we can't afford database round trips at 1M requests per second.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through the architecture one requirement at a time.
+
+For request limiting — every request hits the API Gateway first. The gateway checks rate limit state in Redis, decides allow or deny, and either forwards downstream or returns 429. The backend services never see blocked requests.
+
+For the rate limiting algorithm — there are four main options: fixed window, sliding window log, sliding window counter, and token bucket. I'd go with sliding window counter as a good balance of accuracy and memory efficiency. It approximates the sliding window using the current and previous window counts, giving us smooth rate limiting without storing every individual request timestamp.
+
+For rejection handling — when a request exceeds the limit, we return HTTP 429 with headers: X-RateLimit-Limit, X-RateLimit-Remaining, and Retry-After. This gives clients the information they need to back off gracefully.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> LB[Load Balancer]
+    LB --> API[API Gateway]
+    API --> Core[Core Service]
+    Core --> Redis[(Redis)]
+    Core --> Cache[(Cache)]
+```
+
+**Data Flow:**
+1. 2) The system should limit requests based on configurable rules
+2. 3) When limits are exceeded, reject requests with HTTP 429 and helpful headers[/DETAIL]
+--- SECTION: Deep Dive: Scale to handle 1M requests/second?
+[SAY]So right now we have multiple API gateways talking to a single Redis instance. That breaks at scale — a typical Redis instance handles maybe 100K-200K operations per second, and each rate limit check needs multiple operations. So we're looking at maybe 50K-100K checks per second from one Redis instance. At 1M requests per second, we need to shard.
+
+The sharding strategy follows from our client identification. We hash the rate limit key — which combines client ID, endpoint, and time window — and use consistent hashing to route to the correct Redis shard. The critical thing is that all requests from the same client for the same rule always hit the same shard. If user Alice's requests split across shards, her counter becomes meaningless.
+
+We'd start with maybe 10-20 Redis shards and scale from there. Consistent hashing means adding shards only redistributes a fraction of keys.[/SAY]
+[DETAIL]**Problem:** How do we scale to handle 1M requests/second?[/DETAIL]
+--- SECTION: Deep Dive: Ensure high availability and fault tolerance?
+[SAY]Now with multiple Redis shards, each one is a single point of failure. If a shard goes down, every client whose data lives there loses rate limiting. We need to decide: fail open or fail closed?
+
+I'd go with fail-open. When the rate limiter can't reach Redis, we allow requests through. Yes, we temporarily lose rate limit protection. But the alternative — fail-closed — means a Redis outage takes our entire API offline, which is worse in most cases.
+
+To mitigate the risk, I'd add local in-memory counters at each gateway as a fallback. They won't be globally accurate, but they provide a rough safety net during Redis outages. And of course, each Redis shard gets replicas for standard failover — Redis Sentinel or Redis Cluster handles automatic promotion when a primary goes down.[/SAY]
+[DETAIL]**Problem:** How do we ensure high availability and fault tolerance?
+
+**Solution:** Good Solution: Fail-Open
+ApproachWhen the rate limiter can't reach Redis, allow all requests to proceed as if rate limiting was disabled. The API gateway skips rate limit checks and forwards requests directly to backend services. This keeps your API available even when the rate limiting infrastructure has issues.ChallengesThe obvious downside is temporarily losing rate limit protection. During Redis outages, malicious users could potentially overwhelm your backend services with requests. More critically,this can cause cascade failures- if Redis failed because you're already under heavy load, failing open sends ALL that traffic downstream, potentially causing total system collapse.For social media platforms, this is especially dangerous during viral events when traffic spikes are already stressing the system. Failing open could turn a rate limiter outage into a complete platform failure.
+
+**Alternatives considered:**
+- (Good) Good Solution: Fail-Closed
+- (Good) Good Solution: Fail-Open[/DETAIL]
+--- SECTION: Deep Dive: Minimize latency overhead?
+[SAY]Every rate limit check is a network round trip to Redis, adding latency to every single request. At our scale, we need to minimize that.
+
+First, connection pooling. Each API gateway maintains persistent connections to its Redis shards — no TCP handshake overhead per request. Most Redis clients handle this automatically, but we need to tune pool sizes based on our throughput.
+
+Second, geographic distribution. Deploy Redis shards in each region alongside the API gateways. A user in Tokyo should hit a local Redis instance, not one in Virginia. The trade-off is consistency across regions — a user could slightly exceed their global limit by hitting different regional Redis clusters. But for rate limiting, that's usually fine.
+
+Third, pipelining. If we need to check multiple rules for one request, we can pipeline those Redis commands into a single round trip instead of sequential calls.[/SAY]
+[DETAIL]**Problem:** How do we minimize latency overhead?[/DETAIL]
+--- SECTION: Deep Dive: Handlehot keys(viral content scenarios)?
+[SAY]Hot keys in a rate limiter happen when a single client generates massive traffic — either abuse like a DDoS, or legitimate high-volume clients like analytics pipelines or mobile apps with aggressive polling.
+
+For abusive traffic, the answer is simple: we detect it early and block at the edge. If a client is way over their limit, we can cache the "blocked" status locally at each gateway and stop hitting Redis entirely for that client. The block expires after the window resets.
+
+For legitimate high-volume clients, we can shard their rate limit counter the same way we handle hot write keys in a cache — split the counter across multiple Redis keys with suffixes, write to a random shard, and sum on read. This distributes the write load across multiple Redis instances instead of hammering one.[/SAY]
+[DETAIL]**Problem:** How do we handlehot keys(viral content scenarios)?[/DETAIL]
+--- SECTION: Deep Dive: Handle dynamic rule configuration?
+[SAY]So in production, rules aren't static. We need to change limits without redeploying — bump limits for a product launch, throttle a misbehaving client, give a premium tier more headroom.
+
+I'd use a push-based approach with something like ZooKeeper or etcd. When an operator updates a rule, the config service pushes the change to all connected API gateways within seconds. Each gateway maintains a local cache of rules for fast lookups, and the push system keeps them in sync.
+
+The alternative is polling — gateways periodically fetch the latest rules. It's simpler, but there's a delay between a rule change and enforcement. For most use cases polling every 30 seconds is fine, but if we need instant response — like shutting down an abusive client — push is better.[/SAY]
+[DETAIL]**Problem:** How do we handle dynamic rule configuration?
+
+**Solution:** Great Solution: Push-Based Configuration
+ApproachUse a push-based system where configuration changes are immediately sent to all API gateways. This is exactly whatZooKeeperwas designed for - distributed configuration management with real-time notifications. ZooKeeper maintains configuration data and notifies all connected clients (your API gateways) immediately when any configuration changes. Other options include Redis pub/sub or custom configuration services that maintain persistent connections to gateways.When an operator changes a rate limit rule, the configuration service immediately notifies all connected gateways, which update their rules within seconds.ZooKeeperChallengesThis approach adds a lot more complexity. You need to handle connection failures, ensure all gateways receive updates, and deal with partial failures where some gateways update successfully while others don't. You also need fallback mechanisms when the push system is unavailable.The operational complexity is usually only justified for systems that nee...
+
+**Alternatives considered:**
+- (Good) Good Solution: Poll-Based Configuration[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For fault tolerance, we chose fail-open over fail-closed — we prioritize API availability over strict rate limit enforcement during outages. The risk is temporary loss of protection, but we mitigate that with local fallback counters. For configuration, we went with push-based over polling — more infrastructure complexity with ZooKeeper, but we get near-instant rule updates which matters when we need to react quickly to abuse. For the rate limiting algorithm, sliding window counters over token bucket or fixed windows — a good balance of accuracy and memory efficiency without the edge-case spikes of fixed windows.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Why |
+| --- | --- | --- | --- |
+| How do we ensure high availability and fault toler | Good Solution: Fail-Open | Good Solution: Fail-Open | Better scalability and reliability |[/DETAIL]
+[/SYSDESIGN]

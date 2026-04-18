@@ -1,0 +1,146 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for a distributed cache, let me start with the functional requirements — the core things we need to build.
+
+First, clients need to be able to set, get, and delete key-value pairs. Second, clients should be able to configure expiration times — TTLs — on entries. And third, when the cache fills up, we need an eviction policy. I'll go with LRU unless the interviewer wants something different.
+
+For non-functional requirements — high availability is critical, and eventual consistency is fine here. We need low latency, under 10 milliseconds for get and set operations. And we need to scale to about 1TB of data and 100K requests per second.
+
+Things I'm putting below the line for now: durability across restarts, strong consistency guarantees, complex querying, and transaction support.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Clients can set, get, and delete key-value pairs
+2. Clients can configure expiration time (TTL) on cache entries
+3. Cache evicts entries using LRU policy when capacity is reached
+
+**Non-Functional Requirements:**
+- High availability with eventual consistency acceptable
+- Low latency: < 10ms for get and set operations
+- Scalable to ~1TB of data and 100K requests/second
+
+**Below the Line (Out of Scope):**
+- Durability (data persistence across restarts)
+- Strong consistency guarantees
+- Complex querying capabilities
+- Transaction support[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Okay so the core entities here are pretty straightforward — we're building a cache that stores key-value pairs. So our main entities are the Key and the Value. Really, the data we need to persist in memory is each key and its associated value, plus some metadata like the TTL and a last-accessed timestamp for our LRU eviction.[/SAY]
+[DETAIL]- The core entities are right there in front of our face! We're building a cache that stores key-value pairs, so our entities are `keys` and `values` .
+- In other words, the data we need to persist (in memory) are the keys and their associated values.[/DETAIL]
+--- SECTION: API Design
+[SAY]So the API here is dead simple — three operations: set, get, and delete. I'll keep this brief because the interesting challenges are all in the distributed part, not the interface.
+
+For setting a key-value pair, POST to /:key with the value in the body. For getting, GET /:key returns the value. And for deleting, DELETE /:key removes it. Straightforward CRUD — let me move on to where the real design challenges are.[/SAY]
+[DETAIL]According to our functional requirements, we have three key operations that we'll need to expose via an API: `set` , `get` , and `delete` .
+These should each be rather straightforward, so we can breeze through this.
+Identifying where to spend more and less time in a system design interview based on where the challenges are is an important skill to have. Spending time on simple, auxiliary, or otherwise less important parts of the system is a recipe for running out of time.
+Setting a key-value pair:
+Getting a key-value pair:
+Deleting a key-value pair:
+
+```
+POST /:key
+{
+ "value": "..."
+}
+```
+
+```
+GET /:key -> {value: "..."}
+```
+
+```
+DELETE /:key
+```[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model — this is all in-memory. At its core, a cache is a hash table. We store keys mapped to values plus metadata like TTL and last-access time. No database needed for the cache data itself. If we need to persist configuration like eviction policies or cluster membership, we could use something lightweight, but the actual cache data lives entirely in RAM for speed.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through the architecture one requirement at a time.
+
+First, for basic get/set/delete — at its core, a cache is just a hash table. Every language has one: Python's dict, Java's HashMap, Go's map. They give us O(1) lookups and inserts, which is exactly what we need.
+
+Second, for TTL support — we store a timestamp alongside each value and check it on reads. We also run a background cleanup process to evict expired entries periodically.
+
+Third, for LRU eviction — when the cache is full, we remove the least recently used entry. The classic implementation is a hash map plus a doubly linked list, giving us O(1) for both access tracking and eviction.
+
+Now, this all works great on a single node. The interesting part — scaling this out — is what we'll tackle in the deep dives.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> LB[Load Balancer]
+    LB --> API[API Gateway]
+    API --> Core[Core Service]
+    Core --> Cache[(Cache)]
+```
+
+**Data Flow:**
+1. 1) Users should be able to set, get, and delete key-value pairs
+2. 2) Users should be able to configure the expiration time for key-value pairs
+3. 3) Data should be evicted according to LRU policy[/DETAIL]
+--- SECTION: Deep Dive: Ensure our cache is highly available and fault tolerant?
+[SAY]So our single-node design works, but what happens when that node crashes? We lose everything. For production, we need replication — multiple copies of data across different nodes.
+
+The approach I'd go with is peer-to-peer replication. Every node is equal — they can all accept reads and writes. Changes propagate to other nodes using a gossip protocol, where nodes periodically exchange state with randomly selected peers. There's no single point of failure, and it maps well to our eventual consistency model.
+
+The main trade-off is conflict resolution. Since any node can accept writes, two nodes could update the same key simultaneously. We'd use last-writer-wins with vector clocks or CRDTs to handle that. It's more complex than leader-based replication, but the availability and scalability benefits are worth it for a cache.[/SAY]
+[DETAIL]**Problem:** How do we ensure our cache is highly available and fault tolerant?
+
+**Solution:** Good Solution: Peer-to-Peer Replication
+ApproachIn peer-to-peer replication, each node is equal and can accept both reads and writes. Changes are propagated to other nodes usinggossip protocols, where nodes periodically exchange information about their state with randomly selected peers.This provides scalability and availability since there's no single point of failure. When a node receives a write, it can process it immediately and then asynchronously propagate the change to its peers. The gossip protocol ensures that changes eventually reach all nodes in the cluster.Peer-to-Peer ReplicationChallengesWhile peer-to-peer replication offers great scalability and availability, it comes with some significant challenges. The implementation is more complex than other approaches since each node needs to maintain connections with multiple peers and handle conflict resolution. The eventual consistency model means that different nodes may temporarily have different values for the same key. Additionally, careful consideration must be g...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Synchronous Replication
+- (Good) Good Solution: Asynchronous Replication
+- (Good) Good Solution: Peer-to-Peer Replication[/DETAIL]
+--- SECTION: Deep Dive: Ensure our cache is scalable?
+[SAY]Right, so a single node can't hold 1TB of data or handle 100K requests per second. We need to shard — split our key-value pairs across multiple nodes so each one holds a manageable chunk of the dataset.
+
+The idea is straightforward: given a key, we determine which node it belongs to, and route the request there. Each node is responsible for a subset of the keyspace. As we need more capacity, we add more nodes and redistribute. This is horizontal scaling in its purest form.
+
+The critical question becomes: how do we decide which key goes to which node? A naive hash(key) mod N breaks horribly when we add or remove nodes — nearly every key would need to move. That's where consistent hashing comes in, which I'll cover next.[/SAY]
+[DETAIL]**Problem:** How do we ensure our cache is scalable?[/DETAIL]
+--- SECTION: Deep Dive: Ensure an even distribution of keys across our nodes?
+[SAY]So the answer here is consistent hashing. The naive approach of hash(key) mod N falls apart when nodes change — add or remove one node and almost every key remaps. Consistent hashing fixes this by arranging nodes on a virtual ring. Each key hashes to a point on the ring and gets assigned to the next node clockwise.
+
+The key insight is that when a node joins or leaves, only the keys in its immediate neighborhood get reassigned — roughly 1/N of the total keys instead of nearly all of them. We can also use virtual nodes — each physical node gets multiple positions on the ring — to smooth out the distribution and avoid hotspots from uneven hashing.[/SAY]
+[DETAIL]**Problem:** How can we ensure an even distribution of keys across our nodes?[/DETAIL]
+--- SECTION: Deep Dive: What happens if you have ahot keythat is being read from ...
+[SAY]Okay so hot keys — this comes up a lot. Some keys get way more traffic than others. Think a viral tweet's cache entry or a flash sale product. All that read traffic concentrates on one shard, creating a bottleneck.
+
+The approach I'd take is selective replication of hot keys. Instead of replicating entire nodes, we detect which specific keys are hot — based on access frequency monitoring — and create copies with different suffixes across multiple nodes. So user:123 becomes user:123#1 on node A, user:123#2 on node B, user:123#3 on node C. Reads randomly pick a suffix, spreading the load.
+
+The trade-off is consistency — writes now need to update all copies. But for a cache with eventual consistency, that's perfectly acceptable. And we only pay this cost for the small number of keys that are actually hot.[/SAY]
+[DETAIL]**Problem:** What happens if you have ahot keythat is being read from a lot?
+
+**Solution:** Great Solution: Copies of Hot Keys
+ApproachUnlike read replicas which copy entire nodes, this approach selectively copies only the specific keys that are experiencing high read traffic. The system creates multiple copies of hot keys across different nodes to distribute read load, making it a more targeted solution for handling specific traffic hotspots.Here's how it works:First, the system monitors key access patterns to detect hot keys that are frequently readWhen a key becomes "hot", instead of having just one copy asuser:123, the system creates multiple copies with different suffixes:user:123#1-> Node A stores a copyuser:123#2-> Node B stores a copyuser:123#3-> Node C stores a copyThese copies get distributed to different nodes via consistent hashingFor reads, clients randomly choose one of the suffixed keys, spreading read load across multiple nodesFor writes, the system must update all copies to maintain consistencyFor example, if "product:iphone" becomes a hot key during a flash sale with 100,000 reads/second but ...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Vertical Scaling all Nodes
+- (Good) Good Solution: Dedicated Hot Key Cache
+- (Good) Good Solution: Read Replicas[/DETAIL]
+--- SECTION: Deep Dive: What happens if you have a hot key that is being written ...
+[SAY]Now hot writes are a different beast. With hot reads, we just make more copies. With hot writes, every copy needs the update, so more copies actually makes it worse.
+
+The approach here is sharding the hot key itself with suffixes. Take a counter like views:video123 — instead of one key, we split it into views:video123:1 through views:video123:10 across different nodes. Writes randomly pick a shard, so the load spreads out. When we need the total, we sum across all shards.
+
+This works great for counters and anything that's decomposable. A viral video getting 10K writes per second becomes 1K per shard with 10 shards. The read path is slightly more expensive since we need to aggregate, but the write bottleneck is eliminated.[/SAY]
+[DETAIL]**Problem:** What happens if you have a hot key that is being written to a lot?
+
+**Solution:** Great Solution: Sharding Hot Key With Suffixes
+ApproachKey sharding takes a different approach to handling hot writes by splitting a single hot key into multiple sub-keys distributed across different nodes. This is the one we talk about in many other breakdowns.Instead of having a single counter or value that receives all writes, the system spreads writes across multiple shards using a suffix strategy. For example, a hot counter key "views:video123" might be split into 10 shards: "views:video123:1" through "views:video123:10". When a write arrives, the system randomly selects one of these shards to update.This approach effectively distributes write load across multiple nodes in the cluster. For our viral video example with 10,000 writes per second, using 10 shards would reduce the per-shard write load to roughly 1,000 operations per second. When reading the total value, the system simply needs to sum the values from all shards. This technique is particularly powerful because it works with any operation that can be decomposed and re...[/DETAIL]
+--- SECTION: Deep Dive: Ensure our cache is performant?
+[SAY]So each individual node is fast — O(1) in-memory operations. But once we're distributed across dozens of nodes, performance becomes about network efficiency, not just hash table speed.
+
+The big win here is request batching. Instead of sending one request at a time, the client buffers multiple operations and sends them in a single round trip. This dramatically cuts network overhead. We already touched on this with hot writes, but it's a general technique — fewer round trips means lower aggregate latency.
+
+On top of that, connection pooling between clients and cache nodes eliminates TCP handshake overhead. And we can use client-side routing with a local copy of the consistent hash ring so clients talk directly to the right node, avoiding an extra hop through a proxy.[/SAY]
+[DETAIL]**Problem:** How do we ensure our cache is performant?[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For high availability, we chose peer-to-peer replication — we traded implementation complexity and potential write conflicts for no single point of failure and strong availability. For hot read keys, we went with selective key copies over full read replicas — more targeted, less memory waste, but adds write amplification for those specific keys. And for hot write keys, sharding with suffixes distributes write load at the cost of more expensive reads that need to aggregate across shards. Overall, the theme is we're optimizing for availability and throughput, accepting eventual consistency and some operational complexity.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Why |
+| --- | --- | --- | --- |
+| How do we ensure our cache is highly available and | Good Solution: Peer-to-Peer Replication | Good Solution: Peer-to-Peer Replication | Better scalability and reliability |
+| What happens if you have ahot keythat is being rea | Great Solution: Copies of Hot Keys | Good Solution: Read Replicas | Better scalability and reliability |[/DETAIL]
+[/SYSDESIGN]

@@ -1,11 +1,15 @@
 import SwiftUI
 
-struct MessageBubble: View {
+struct MessageBubble: View, Equatable {
     let message: Message
     @State private var isHovering = false
     @State private var showCopied = false
 
-    private let accentTeal = Color(hex: "00BCD4")
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.message == rhs.message
+    }
+
+    private let accentTeal = Color(hex: "22C55E")
     private let surfaceColor = Color(hex: "161B22")
     private let borderColor = Color(hex: "30363D")
 
@@ -14,29 +18,21 @@ struct MessageBubble: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 0) {
-            if isUser { Spacer(minLength: 60) }
+            if isUser { Spacer(minLength: 16) }
 
-            VStack(alignment: isUser ? .trailing : .leading, spacing: 6) {
+            VStack(alignment: isUser ? .trailing : .leading, spacing: 4) {
                 // Attachments
                 if !message.attachments.isEmpty {
                     attachmentsView
                 }
 
-                // Message content
+                // Message content with overlay copy button
                 contentBubble
-
-                // Timestamp (shown on hover)
-                if isHovering {
-                    Text(formatTimestamp(message.timestamp))
-                        .font(.system(size: 10))
-                        .foregroundStyle(.white.opacity(0.3))
-                        .transition(.opacity.combined(with: .scale(scale: 0.95)))
-                }
             }
 
-            if isAssistant { Spacer(minLength: 60) }
+            if isAssistant { Spacer(minLength: 16) }
         }
-        .padding(.horizontal, 16)
+        .padding(.horizontal, 12)
         .padding(.vertical, 4)
         .onHover { hovering in
             withAnimation(.easeInOut(duration: 0.15)) {
@@ -48,46 +44,55 @@ struct MessageBubble: View {
     // MARK: - Content Bubble
 
     private var contentBubble: some View {
-        HStack(alignment: .bottom, spacing: 8) {
+        HStack(alignment: .top, spacing: 8) {
             if isAssistant {
                 assistantAvatar
             }
 
-            VStack(alignment: isUser ? .trailing : .leading, spacing: 0) {
-                if isAssistant {
-                    markdownContent
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-                        .background(
-                            BubbleShape(isUser: false)
-                                .fill(surfaceColor)
-                                .overlay(
-                                    BubbleShape(isUser: false)
-                                        .stroke(borderColor, lineWidth: 1)
-                                )
-                        )
-                } else {
-                    Text(message.content)
-                        .font(.system(size: 14))
-                        .foregroundStyle(.white.opacity(0.95))
-                        .textSelection(.enabled)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-                        .background(
-                            BubbleShape(isUser: true)
-                                .fill(accentTeal.opacity(0.2))
-                                .overlay(
-                                    BubbleShape(isUser: true)
-                                        .stroke(accentTeal.opacity(0.35), lineWidth: 1)
-                                )
-                        )
+            bubbleContent
+                .overlay(alignment: isUser ? .bottomLeading : .bottomTrailing) {
+                    if isHovering {
+                        copyButton
+                            .offset(x: isUser ? -4 : 4, y: 4)
+                            .transition(.opacity)
+                    }
                 }
-            }
+        }
+    }
 
-            // Copy button for assistant messages
-            if isAssistant && isHovering {
-                copyButton
-                    .transition(.opacity.combined(with: .scale(scale: 0.9)))
+    private var bubbleContent: some View {
+        Group {
+            if isAssistant {
+                MarkdownContentView(
+                    content: message.content,
+                    accentTeal: accentTeal,
+                    borderColor: borderColor
+                )
+                .equatable()
+                .padding(.vertical, 10)
+                .background(
+                    BubbleShape(isUser: false)
+                        .fill(surfaceColor)
+                        .overlay(
+                            BubbleShape(isUser: false)
+                                .stroke(borderColor, lineWidth: 1)
+                        )
+                )
+            } else {
+                Text(message.content)
+                    .font(.system(size: 14))
+                    .foregroundStyle(.white.opacity(0.95))
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(
+                        BubbleShape(isUser: true)
+                            .fill(accentTeal.opacity(0.2))
+                            .overlay(
+                                BubbleShape(isUser: true)
+                                    .stroke(accentTeal.opacity(0.35), lineWidth: 1)
+                            )
+                    )
             }
         }
     }
@@ -103,28 +108,6 @@ struct MessageBubble: View {
             Image(systemName: "sparkles")
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(accentTeal)
-        }
-    }
-
-    // MARK: - Markdown Content
-
-    private var markdownContent: some View {
-        Group {
-            if let attributed = try? AttributedString(
-                markdown: message.content,
-                options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-            ) {
-                Text(attributed)
-                    .font(.system(size: 14))
-                    .foregroundStyle(.white.opacity(0.9))
-                    .textSelection(.enabled)
-                    .tint(accentTeal)
-            } else {
-                Text(message.content)
-                    .font(.system(size: 14))
-                    .foregroundStyle(.white.opacity(0.9))
-                    .textSelection(.enabled)
-            }
         }
     }
 
@@ -190,9 +173,9 @@ struct MessageBubble: View {
             }
         } label: {
             Image(systemName: showCopied ? "checkmark" : "doc.on.doc")
-                .font(.system(size: 11))
-                .foregroundStyle(showCopied ? .green : .white.opacity(0.4))
-                .frame(width: 26, height: 26)
+                .font(.system(size: 10))
+                .foregroundStyle(showCopied ? .green : .white.opacity(0.5))
+                .frame(width: 22, height: 22)
                 .background(
                     Circle()
                         .fill(surfaceColor)
@@ -222,7 +205,6 @@ private struct BubbleShape: Shape {
         let smallRadius: CGFloat = 4
         return Path { path in
             if isUser {
-                // User: rounded corners, smaller bottom-right
                 path.move(to: CGPoint(x: rect.minX + radius, y: rect.minY))
                 path.addLine(to: CGPoint(x: rect.maxX - radius, y: rect.minY))
                 path.addArc(
@@ -245,7 +227,6 @@ private struct BubbleShape: Shape {
                     radius: radius, startAngle: .degrees(180), endAngle: .degrees(270), clockwise: false
                 )
             } else {
-                // Assistant: rounded corners, smaller bottom-left
                 path.move(to: CGPoint(x: rect.minX + radius, y: rect.minY))
                 path.addLine(to: CGPoint(x: rect.maxX - radius, y: rect.minY))
                 path.addArc(

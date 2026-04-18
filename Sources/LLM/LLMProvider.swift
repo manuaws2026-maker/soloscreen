@@ -38,8 +38,8 @@ final class LLMRouter {
 
     init() {
         register(OpenAIProvider())
-        // Future: register(ClaudeProvider())
-        // Future: register(GeminiProvider())
+        register(ClaudeProvider())
+        register(GeminiProvider())
     }
 
     func register(_ provider: any LLMProvider) {

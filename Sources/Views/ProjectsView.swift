@@ -12,7 +12,7 @@ struct ProjectsView: View {
     @State private var showFilePicker: Bool = false
     @State private var activeProjectId: UUID?
 
-    private let accentTeal = Color(hex: "00BCD4")
+    private let accentTeal = Color(hex: "22C55E")
     private let bgColor = Color(hex: "0D1117")
     private let surfaceColor = Color(hex: "161B22")
     private let borderColor = Color(hex: "30363D")

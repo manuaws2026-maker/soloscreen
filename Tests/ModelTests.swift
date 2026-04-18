@@ -1,6 +1,6 @@
 import Testing
 import Foundation
-@testable import SubtleAI
+@testable import SoloScreen
 
 // MARK: - Session Tests
 

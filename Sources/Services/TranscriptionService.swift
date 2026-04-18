@@ -13,7 +13,7 @@ actor TranscriptionService {
     /// Supported transcription providers.
     enum Provider: String, Sendable {
         case deepgram
-        case whisperLocal  // Reserved for future local Whisper integration.
+        case openai  // OpenAI Whisper API (batch only; no live streaming).
     }
 
     struct TranscriptionResult: Sendable {
@@ -29,6 +29,7 @@ actor TranscriptionService {
         case unsupportedProvider(String)
         case networkError(underlying: Error)
         case invalidResponse
+        case apiError(status: Int, detail: String)
         case webSocketNotConnected
         case emptyAudioData
 
@@ -42,6 +43,8 @@ actor TranscriptionService {
                 return "Transcription network error: \(err.localizedDescription)"
             case .invalidResponse:
                 return "Received an invalid response from the transcription service."
+            case .apiError(let status, let detail):
+                return "Transcription API error (\(status)): \(detail)"
             case .webSocketNotConnected:
                 return "WebSocket is not connected to the transcription service."
             case .emptyAudioData:
@@ -67,6 +70,7 @@ actor TranscriptionService {
     private static let baseReconnectDelay: TimeInterval = 1.0
     private static let deepgramRESTEndpoint = "https://api.deepgram.com/v1/listen"
     private static let deepgramWSEndpoint = "wss://api.deepgram.com/v1/listen"
+    private static let openaiTranscriptionEndpoint = "https://api.openai.com/v1/audio/transcriptions"
 
     // MARK: - Batch Transcription
 
@@ -88,14 +92,108 @@ actor TranscriptionService {
         switch provider.lowercased() {
         case "deepgram":
             return try await transcribeWithDeepgram(audioData, apiKey: apiKey)
-        case "whisper", "whisper_local":
-            throw TranscriptionError.unsupportedProvider("whisper_local (not yet implemented)")
+        case "openai", "whisper":
+            return try await transcribeWithOpenAI(audioData, apiKey: apiKey)
         default:
             throw TranscriptionError.unsupportedProvider(provider)
         }
     }
 
+    /// Send audio to OpenAI's Whisper API for batch transcription.
+    /// Wraps the raw 16 kHz PCM as a WAV file and submits via multipart/form-data.
+    private func transcribeWithOpenAI(_ audioData: Data, apiKey: String) async throws -> String {
+        guard let url = URL(string: Self.openaiTranscriptionEndpoint) else {
+            throw TranscriptionError.invalidResponse
+        }
+
+        // OpenAI requires a file-typed upload; wrap the PCM data in a WAV container.
+        let wavData = Self.wrapPCMAsWAV(audioData, sampleRate: 16_000, channels: 1, bitsPerSample: 16)
+        let boundary = "soloscreen-\(UUID().uuidString)"
+
+        var body = Data()
+        func append(_ s: String) { body.append(s.data(using: .utf8)!) }
+
+        append("--\(boundary)\r\n")
+        append("Content-Disposition: form-data; name=\"model\"\r\n\r\n")
+        append("gpt-4o-mini-transcribe\r\n")
+
+        append("--\(boundary)\r\n")
+        append("Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n")
+        append("Content-Type: audio/wav\r\n\r\n")
+        body.append(wavData)
+        append("\r\n--\(boundary)--\r\n")
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch {
+            throw TranscriptionError.networkError(underlying: error)
+        }
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw TranscriptionError.invalidResponse
+        }
+        guard (200...299).contains(httpResponse.statusCode) else {
+            let body = String(data: data, encoding: .utf8) ?? "(no body)"
+            throw TranscriptionError.apiError(status: httpResponse.statusCode, detail: body)
+        }
+
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let text = json["text"] as? String else {
+            return ""
+        }
+        return text
+    }
+
+    /// Wrap raw little-endian PCM audio in a minimal RIFF/WAV header so the
+    /// OpenAI endpoint recognizes the upload as an audio file.
+    private static func wrapPCMAsWAV(
+        _ pcm: Data,
+        sampleRate: UInt32,
+        channels: UInt16,
+        bitsPerSample: UInt16
+    ) -> Data {
+        var header = Data()
+        let byteRate = sampleRate * UInt32(channels) * UInt32(bitsPerSample) / 8
+        let blockAlign = channels * bitsPerSample / 8
+        let dataSize = UInt32(pcm.count)
+        let chunkSize = 36 + dataSize
+
+        func appendLE<T: FixedWidthInteger>(_ v: T) {
+            var le = v.littleEndian
+            withUnsafeBytes(of: &le) { header.append(contentsOf: $0) }
+        }
+
+        header.append("RIFF".data(using: .ascii)!)
+        appendLE(chunkSize)
+        header.append("WAVE".data(using: .ascii)!)
+        header.append("fmt ".data(using: .ascii)!)
+        appendLE(UInt32(16))                // fmt chunk size
+        appendLE(UInt16(1))                 // PCM format
+        appendLE(channels)
+        appendLE(sampleRate)
+        appendLE(byteRate)
+        appendLE(blockAlign)
+        appendLE(bitsPerSample)
+        header.append("data".data(using: .ascii)!)
+        appendLE(dataSize)
+
+        var out = Data(capacity: header.count + pcm.count)
+        out.append(header)
+        out.append(pcm)
+        return out
+    }
+
     /// Send audio to Deepgram's REST API for batch transcription.
+    /// Wraps raw PCM as WAV — universally accepted and avoids any
+    /// content-type ambiguity with raw PCM.
     private func transcribeWithDeepgram(_ audioData: Data, apiKey: String) async throws -> String {
         var urlComponents = URLComponents(string: Self.deepgramRESTEndpoint)
         urlComponents?.queryItems = [
@@ -109,11 +207,13 @@ actor TranscriptionService {
             throw TranscriptionError.invalidResponse
         }
 
+        let wavData = Self.wrapPCMAsWAV(audioData, sampleRate: 16_000, channels: 1, bitsPerSample: 16)
+
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("Token \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("audio/l16;rate=16000;channels=1", forHTTPHeaderField: "Content-Type")
-        request.httpBody = audioData
+        request.setValue("audio/wav", forHTTPHeaderField: "Content-Type")
+        request.httpBody = wavData
 
         let data: Data
         let response: URLResponse
@@ -123,8 +223,12 @@ actor TranscriptionService {
             throw TranscriptionError.networkError(underlying: error)
         }
 
-        guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
+        guard let httpResponse = response as? HTTPURLResponse else {
             throw TranscriptionError.invalidResponse
+        }
+        guard (200...299).contains(httpResponse.statusCode) else {
+            let body = String(data: data, encoding: .utf8) ?? "(no body)"
+            throw TranscriptionError.apiError(status: httpResponse.statusCode, detail: body)
         }
 
         return parseDeepgramRESTResponse(data)

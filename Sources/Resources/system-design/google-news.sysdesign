@@ -1,0 +1,192 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for Google News, let me start with the functional requirements.
+
+First, users need to see an aggregated feed of news articles from thousands of publishers worldwide. Second, they should be able to scroll through that feed infinitely. And third, when they click an article, they get redirected to the publisher's website — we're an aggregator, not a content host.
+
+For non-functional requirements — feed requests need to be low latency, under 200ms. New articles should appear in feeds within 30 minutes of publication so we're not stale on breaking news. And we need to handle scale — think 100 million daily active users, each refreshing their feed multiple times a day. That's easily 500 million to a billion feed requests per day.
+
+Below the line for now: personalized recommendations, article deduplication across publishers, and content moderation.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Users can view an aggregated feed of news articles from thousands of publishers worldwide
+2. Users can scroll through the feed infinitely
+3. Users can click articles to be redirected to the publisher's website
+
+**Non-Functional Requirements:**
+- Low-latency feed requests: < 200ms response time
+- Article freshness: new articles appear in feeds within 30 minutes of publication
+- High scale: ~100M daily active users, 500M-1B feed requests/day
+- High availability: 99.9% uptime
+
+**Below the Line (Out of Scope):**
+- Personalized recommendations and ML ranking
+- Article deduplication across publishers
+- Content moderation and fake news detection
+- User accounts and saved articles[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Let me define the core entities. We've got three.
+
+An Article is our core content entity — it has an ID, title, summary, thumbnail URL, publish date, publisher, region, and media URLs. We store the metadata but not the full article content since we link out to publishers.
+
+A Publisher represents a news source — name, URL, RSS feed URL, and the region they cover. And a User — even if they're anonymous, we track basic info like their region, which might be inferred from IP, so we can serve them relevant content.[/SAY]
+[DETAIL]- **Article** : Represents a news article with attributes like id, title, summary, thumbnail URL, publish date, publisher ID, region, and media URLs. This is our core content entity.
+- **Publisher** : Represents a news source with attributes like id, name, URL, feed URL, and region. Publishers are the origin of our content.
+- **User** : Represents system users with attributes like id and region (which may be inferred from IP or explicitly set). Even with anonymous users, we track basic information.[/DETAIL]
+--- SECTION: API Design
+[SAY]The API here is pretty simple since we're primarily a read-heavy system. The main endpoint is a GET to /feed with pagination parameters and a region filter, which returns a list of articles.
+
+I'm starting with offset-based pagination for simplicity, but that has issues with infinite scrolling — if new articles get added while a user is browsing, page boundaries shift and they'll see duplicates or miss content. I'll address that with cursor-based pagination in a deep dive.
+
+For viewing an actual article, we don't need an API endpoint at all. The client just navigates to the publisher's URL from the article object. We're an aggregator — we point users to the source.[/SAY]
+[DETAIL]The API is the main way users will interact with our news feed system. Defining it early helps us structure the rest of our design. I'll create endpoints for each of our core requirements.
+For users to view an aggregated feed of news articles:
+We're starting with simple offset-based pagination for now, but this has performance issues for infinite scrolling. We'll improve this to cursor-based pagination in our deep dive to handle the scale and user experience requirements better.
+For users to view a specific article we don't need an API endpoint, since their browser will navigate to the publisher's website once they click on the article based on the `url` field in the article object.
+
+```
+// Get a page of articles for the user's feed
+GET /feed?page={page}&limit={limit}&region={region} -> Article[]
+```[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, I'd use PostgreSQL for our core entities — articles, publishers, users. We need reliable storage with good query support for filtering by region and sorting by date.
+
+But with 100 million users hitting the feed endpoint, we're going to need a caching layer too. I'll get into Redis for pre-computed feeds in the deep dives — Postgres alone won't hit our 200ms latency target at this scale.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through the architecture one requirement at a time.
+
+For the aggregated feed — we need two distinct pieces. First, a Data Collection Service that runs as a background process, continuously crawling RSS feeds from thousands of publishers and storing articles in our database. Second, a Feed Service that handles user requests and returns articles sorted by recency, filtered by region.
+
+For infinite scrolling — we enhance the Feed Service to support pagination. For now it's simple offset-based pagination with page numbers and limits.
+
+For article redirection — this is essentially free. The browser handles it. When users click an article in the feed, the client just navigates to the URL stored in the article object. We don't host content, we just point to it.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> LB[Load Balancer]
+    LB --> API[API Gateway]
+    API --> TheFeed[The Feed Service]
+    API --> ToAppropriate[To Appropriate Service]
+    API --> DataCollection[Data Collection Service]
+    API --> Feed[Feed Service]
+    API --> StorageFeed[Storage Feed Service]
+    StorageFeed --> Database[(Database)]
+```
+
+**Data Flow:**
+1. 1) Users should be able to view an aggregated feed of news articles from thousands of source publishers all over the world
+2. 2) Users should be able to scroll through the feed "infinitely"
+3. 3) Users should be able to click on articles and be redirected to the publisher's website to read the full content[/DETAIL]
+--- SECTION: Deep Dive: Improve pagination consistency and efficiency?
+[SAY]So our offset-based pagination breaks down in a news feed where content is constantly being added. If a user is on page 2 and five new articles get published, everything shifts down — they'll see duplicate articles on page 3 or miss content entirely. During a busy news day with 50-100 new articles per hour, this happens constantly.
+
+The fix is cursor-based pagination. And the cleanest approach is to use monotonically increasing article IDs — ULIDs or auto-increment IDs instead of random UUIDs. Since articles are collected chronologically, newer articles always have higher IDs.
+
+Now pagination becomes dead simple: the query is just `WHERE article_id < cursor_id ORDER BY article_id DESC LIMIT 20`. The cursor is a single ID value the client passes back. No timestamp collisions, no composite cursors, and the database only needs a simple index on article_id. It's as efficient as pagination gets.[/SAY]
+[DETAIL]**Problem:** How can we improve pagination consistency and efficiency?
+
+**Solution:** Great Solution: Monotonically Increasing Article IDs
+ApproachAn even simpler solution that achieves the same result is to design article IDs to be monotonically increasing from the start. Instead of using random UUIDs, we can use time-ordered UUIDs (like ULIDs) or database auto-increment IDs that naturally increase with each new article. Since articles are collected chronologically, newer articles will always have higher IDs than older ones.Now pagination becomes incredibly simple: we just use the article ID as our cursor. The query becomesWHERE article_id < cursor_id ORDER BY article_id DESC LIMIT 20. No composite cursors, no timestamp handling, and no complex tuple comparisons needed. The cursor is just a single ID value that the client passes back for the next page.This eliminates timestamp collision issues entirely because each article gets a unique, ordered identifier regardless of when it was published. The database only needs a simple index on the article_id column, and the queries are as fast and simple as possible. Many modern s...
+
+**Alternatives considered:**
+- (Good) Good Solution: Timestamp-Based Cursors[/DETAIL]
+--- SECTION: Deep Dive: Achieve low latency (< 200ms) feed requests?
+[SAY]Right now we're querying the database directly for every feed request. With a billion requests per day and millions of articles to filter through, we'll blow past our 200ms target easily.
+
+The approach I'd go with is pre-computed feeds cached in Redis. We maintain sorted sets per region — `feed:US`, `feed:UK`, and so on — with article IDs scored by timestamp. But instead of a simple TTL-based cache, I'd use Change Data Capture to keep it fresh in real time.
+
+Here's how it works: when the Data Collection Service writes a new article to the database, a CDC event fires. A Feed Generation Worker picks that up, determines which regional feeds it belongs to, and adds it to the appropriate Redis sorted sets immediately. No polling, no TTL expiration delays.
+
+Feed requests now hit Redis instead of Postgres — a `ZREVRANGE` on a sorted set is sub-millisecond. We keep the most recent 1000 or so articles per region and trim the rest. If Redis is down, we fall back to the database.[/SAY]
+[DETAIL]**Problem:** How do we achieve low latency (< 200ms) feed requests?
+
+**Solution:** Great Solution: Real-time Cached Feeds with CDC
+ApproachThe most effective solution pre-computes and caches feeds for each region using Change Data Capture (CDC) for immediate updates. We maintain pre-computed feeds in Redis as sorted sets containing article IDs and essential metadata, organized by region. When new articles are published, CDC triggers immediately update the relevant regional caches without waiting for TTL expiration.Here's how the system works: our Data Collection Service stores new articles in the database, which triggers CDC events. These CDC events are consumed by Feed Generation Workers that immediately determine which regional feeds need updates based on the article's region and relevance. They then add the new article to the appropriate Redis sorted sets with its timestamp as the score, maintaining the chronologic...
+
+**Alternatives considered:**
+- (Good) Good Solution: Redis Cache with TTL[/DETAIL]
+--- SECTION: Deep Dive: Ensure articles appear in feeds within 30 minutes of publ...
+[SAY]Our current RSS polling approach runs every few hours, which is way too slow. By the time we discover breaking news, users have already seen it on social media. We need articles in feeds within 30 minutes of publication.
+
+The best approach is to flip from pull to push. We build a webhook endpoint — POST /webhooks/article-published — that publishers call the moment they publish. If we've got 100 million daily users, publishers have strong incentive to integrate with us.
+
+When a publisher hits our webhook, we validate the payload, extract the article data, and queue it for processing through our standard ingestion pipeline. We'd authenticate publishers using API keys to prevent spam.
+
+But not every publisher will implement webhooks. So we keep RSS polling as a fallback, just at a higher frequency — every 15-30 minutes instead of every few hours. The webhook publishers get near-instant discovery, and the rest are still within our 30-minute target. Over time, as more publishers adopt webhooks, we can reduce polling frequency further.[/SAY]
+[DETAIL]**Problem:** How do we ensure articles appear in feeds within 30 minutes of publication?
+
+**Solution:** Great Solution: Publisher Webhooks with Fallback Polling
+ApproachThe optimal solution flips our model from pull-based to push-based by implementingwebhookswhere publishers notify us immediately when they publish new content. If we assume we really have 100M DAU, then publishers should be clamoring to get their articles on our platform.We can build a webhook endpoint atPOST /webhooks/article-publishedthat publishers can call the moment they publish an article, containing the article metadata or even the full content payload. This way, instead of us trying to find new articles, we can rely on them telling us about them!Our webhook infrastructure consists of a high-availability endpoint that can handle sudden traffic spikes when major stories break and multiple publishers notify us simultaneously. The endpoint validates incoming webhook payloads, extracts article data, and immediately queues the content for processing through our standard ingestion pipeline. We'd need to implement webhook authentication using shared secrets or API keys to preve...
+
+**Alternatives considered:**
+- (Good) Good Solution: Increased RSS Polling Frequency
+- (Good) Good Solution: Intelligent Web Scraping[/DETAIL]
+--- SECTION: Deep Dive: Handle media content (images/videos) efficiently?
+[SAY]Since we're linking to publisher sites rather than hosting full articles, our media needs are simpler — we just need thumbnails in the feed. But with 100 million users scrolling through feeds, even thumbnails need to be fast and reliable.
+
+I'd store thumbnails in S3 and serve them through CloudFront CDN. When we ingest an article, we download the primary image and generate multiple sizes — 150x100 for mobile, 300x200 for desktop, 600x400 for retina — and upload them all to S3. The client uses srcset to request the appropriate size.
+
+CloudFront caches these at edge locations worldwide, so a user in Tokyo loads the thumbnail from a nearby edge node in single-digit milliseconds. The CDN absorbs over 90% of the requests so S3 barely gets hit directly. Storage cost for multiple thumbnail variants is minimal compared to the performance gain.[/SAY]
+[DETAIL]**Problem:** How do we handle media content (images/videos) efficiently?
+
+**Solution:** Great Solution: S3 + CloudFront CDN with Multiple Sizes
+ApproachTo avoid global users experiencing high latency when loading thumbnails from distant S3 regions, we can use a CDN to serve the thumbnails.Store thumbnails in S3 and serve them through CloudFront CDN for global distribution. We generate multiple thumbnail sizes (150x100 for mobile, 300x200 for desktop, 600x400 for retina displays) and use HTMLsrcsetattributes or client-side logic to request the appropriate version based on device and screen density.S3 + CloudFront CDN with Multiple SizesCloudFront caches thumbnails at edge locations worldwide, ensuring sub-200ms load times globally.ChallengesThe downside is higher storage costs for multiple thumbnail variants, but this is minimal compared to the performance gains. The CDN caching reduces S3 requests by over 90%, significantly lowering overall costs while providing an optimal user experience.
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Database Blob Storage
+- (Good) Good Solution: S3 Storage with Direct Links[/DETAIL]
+--- SECTION: Deep Dive: Handle traffic spikes during breaking news?
+[SAY]Breaking news creates massive traffic spikes — elections, natural disasters, celebrity news. We could go from normal traffic to 10 million concurrent users within minutes, all wanting the latest updates.
+
+The good news is that news consumption is inherently regional. Americans want US news, Europeans want EU news. So we can scale regionally rather than globally. Each region gets its own Redis cache, Feed Service instances, and CDN edge locations. A spike in US traffic during an election doesn't affect European users at all.
+
+For the spike itself, our CDN absorbs most of the read load since many users are requesting the same regional feed. Behind the CDN, we auto-scale Feed Service instances based on request rate. And since our feeds are pre-computed in Redis, each request is just a sorted set lookup — we can handle enormous throughput per instance.[/SAY]
+[DETAIL]**Problem:** How do we handle traffic spikes during breaking news?[/DETAIL]
+--- SECTION: Deep Dive: Support category-based news feeds (Sports, Politics, Tech...
+[SAY]Right now we only have regional feeds like `feed:US` and `feed:UK`, but users expect to browse by category — Sports, Politics, Technology, and so on.
+
+The simplest approach that actually works at scale is in-memory filtering. Instead of maintaining separate Redis sorted sets for every region-category combination, we store article metadata including the category field in our regional cache entries. When a user requests `/feed?region=US&category=sports`, the Feed Service pulls the top 1000 articles from `feed:US` via ZREVRANGE and filters in memory for the sports category.
+
+This sounds expensive but it's not — filtering 1000 JSON objects in memory takes microseconds. And it avoids the combinatorial explosion of maintaining separate caches for every region-category pair, which with 25+ categories and dozens of regions would be hundreds of sorted sets to keep synchronized.[/SAY]
+[DETAIL]**Problem:** How can we support category-based news feeds (Sports, Politics, Tech, etc.)?
+
+**Solution:** Great Solution: In-memory filtering
+ApproachIn my opinion, the above is overkill. We can just modify our regional feeds to include category information in each cached article, then filter results in-memory when users request specific categories.When we cache articles infeed:US, instead of storing just article IDs as members, we store complete article metadata as JSON strings. Each cached article includes all the information needed for category filtering - title, description, URL, category, region, and publication timestamp.A typical cache entry looks like this:{
+ "id": "123",
+ "title": "NBA Finals Game 7 Results",
+ "description": "Warriors defeat Celtics in thrilling finale",
+ "url": "https://espn.com/nba/finals/game7",
+ "category": "sports",
+ "region": "US",
+ "published_at": "2024-06-21T22:30:00Z"
+}When users request category-specific feeds like/feed?region=US&category=sports, our Feed Service retrieves the entire regional cache usingZREVRANGE feed:US 0 999to get the most recent 1,000 articles. The service then filters ...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Database Query Filtering with Category Column
+- (Good) Good Solution: Pre-computed Category Feeds in Redis[/DETAIL]
+--- SECTION: Deep Dive: Generate personalized feeds based on user reading behavio...
+[SAY]Right now every user in a region sees the same feed, but modern news platforms personalize. The challenge is doing this without blowing up our infrastructure — we can't maintain a separate cache for each of our 100 million users.
+
+The approach is hybrid personalization with dynamic feed assembly. We store a lightweight preference vector per user — just a few kilobytes — that captures their topic interests based on reading behavior. Then at request time, we assemble a personalized feed by mixing from our existing category caches.
+
+So a user who reads a lot of tech news might get a feed that's 60% from `feed:technology:US`, 30% from `feed:business:US`, and 10% from `feed:trending:US`. The mixing ratios come from their preference vector. This reuses all our existing category cache infrastructure — no new caches needed — and the assembly is just pulling from a few sorted sets and interleaving, which is fast.
+
+During breaking news, we temporarily boost the trending weight for everyone so nobody misses important stories.[/SAY]
+[DETAIL]**Problem:** How do we generate personalized feeds based on user reading behavior and preferences?
+
+**Solution:** Great Solution: Hybrid Personalization with Dynamic Feed Assembly
+ApproachThe optimal solution stores lightweight user preference vectors (just kilobytes per user) and assembles personalized feeds on-demand by mixing pre-computed category feeds. Instead of 100M user caches, we maintain a few hundred category caches and personalize through intelligent assembly.A user interested in technology gets a feed assembled from 60%feed:technology:US, 30%feed:business:US, and 10%feed:trending:US. The mixing algorithm uses their preference vector to determine optimal ratios. During breaking news, the system temporarily boosts trending content weights while maintaining personal preferences.This builds on our existing category cache infrastructure, reducing memory requirements by 100x while delivering relevant personalized experiences. Machine learning adjusts mixing ratios based on engagement patterns, and fallback strategies maintain performance during high traffic.ChallengesReduced personalization depth compared to full recommendation engines. Assembly algorithm...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Real-time Recommendation Scoring
+- (Good) Good Solution: Pre-computed User Feed Caches[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For pagination, monotonically increasing IDs over timestamp cursors — simpler queries and no collision issues, but we're coupling our ID scheme to our access pattern. For feed latency, CDC-driven Redis caches over TTL-based caches — we get real-time freshness instead of waiting for TTL expiration, but CDC adds infrastructure complexity. For article freshness, webhooks with polling fallback over pure polling — near-instant discovery for webhook publishers, but we still need polling as a safety net. And for media, S3 plus CDN over direct storage — higher storage cost for multiple thumbnail sizes, but globally fast delivery.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Why |
+| --- | --- | --- | --- |
+| How can we improve pagination consistency and effi | Great Solution: Monotonically Increasing Article IDs | Good Solution: Timestamp-Based Cursors | Better scalability and reliability |
+| How do we achieve low latency (< 200ms) feed reque | Great Solution: Real-time Cached Feeds with CDC | Good Solution: Redis Cache with TTL | Better scalability and reliability |
+| How do we ensure articles appear in feeds within 3 | Great Solution: Publisher Webhooks with Fallback Polling | Good Solution: Intelligent Web Scraping | Better scalability and reliability |
+| How do we handle media content (images/videos) eff | Great Solution: S3 + CloudFront CDN with Multiple Sizes | Good Solution: S3 Storage with Direct Links | Better scalability and reliability |[/DETAIL]
+[/SYSDESIGN]

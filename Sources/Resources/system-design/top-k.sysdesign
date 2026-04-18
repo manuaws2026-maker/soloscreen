@@ -1,0 +1,157 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for a Top K system — like top K most viewed videos on YouTube — let me lay out the requirements.
+
+For functional requirements, clients need to query the top K most viewed videos across different time windows — last hour, last day, last month, and all time. K can be up to 1,000 results.
+
+For non-functional requirements — we'll tolerate at most a 1-minute delay between when a view happens and when it's reflected in results. Results must be precise, no approximations. Response latency should be in the tens of milliseconds. And the system needs to handle a massive volume of view events — we're talking YouTube scale, so potentially millions of views per second.
+
+Below the line: video metadata, user authentication, recommendation algorithms, and the video serving infrastructure itself. We're just consuming a stream of view events from an existing system.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Clients can query top K most viewed videos for time windows: last hour, last day, last month, all-time
+2. K is configurable up to 1,000 results
+
+**Non-Functional Requirements:**
+- Freshness: < 1 minute delay between view event and tabulation in results
+- Precision: exact counts, no approximations
+- Query latency: < 50ms response time
+- Throughput: handle millions of view events per second (YouTube-scale)
+
+**Below the Line (Out of Scope):**
+- Video metadata and serving
+- User authentication
+- Recommendation algorithms
+- View event generation (we consume from an existing Kafka stream)[/DETAIL]
+--- SECTION: Core Entities
+[SAY]The entities here are minimal, which is nice. A Video is the thing being viewed — we just need its ID for counting purposes. A View is the event that a video was watched — videoId and timestamp. And a Time Window defines the scope of the query — all time, last hour, last day, last month.[/SAY]
+[DETAIL]- **Video** : The video being viewed.
+- **View** : The view event that happened.
+- **Time Window** : The time window associated with the query "all time", "last hour", "last day", "last month".[/DETAIL]
+--- SECTION: API Design
+[SAY]The API here is dead simple — one endpoint. GET /views/top-k with a window parameter and a k parameter. Returns an array of videoId and view count pairs, sorted by views descending.
+
+We're explicitly capping results at 1,000, so pagination isn't a concern. I'm not going to spend much time here because the interesting part of this problem is all in the backend — how we efficiently count and rank at massive scale.[/SAY]
+[DETAIL]Our API guides the rest of the interview, but in this case it's really basic too! We simply need an API to retrieve the top K videos.
+Normally, for variable length result sets like this we might want to consider pagination. For this problem, we're explicitly limiting responses to no more than 1k results, so pagination is less of a concern. We already let clients tell us how many results they want.
+That's it. We're not going to dawdle here and keep moving on to the meat of the interview.
+Especially for more senior candidates, it's important to focus your efforts on the "interesting" aspects of the interview. Spending too much time on obvious elements both deprives you of time for the more interesting parts of the interview but also signals to the interviewer that you may not be able to distinguish more complex pieces from trivial ones: a critical skill for senior engineers.
+
+```
+GET /views/top-k?window={WINDOW}&k={K} -> { videoId: string, views: number }[]
+```[/DETAIL]
+--- SECTION: Data Model
+[SAY]For storage, I'd start with a Postgres table that tracks view counts per video per time bucket. Each row has a videoId, an hourly timestamp bucket, and a count. This means we'll have multiple rows per video — one for each hour it was viewed.
+
+For the all-time leaderboard, we can maintain a separate aggregated table. But honestly, as we'll see in the deep dives, the real question is whether Postgres can handle the write throughput at all — and the answer is probably not at YouTube scale. So we'll likely need something more specialized.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through this step by step.
+
+For the all-time top K, we consume view events from an existing Kafka stream. A consumer service reads these events, increments counters in a database keyed by videoId and time bucket, and that's our write path. For reads, a Top-K Service queries the database, aggregates counts across the relevant time window, sorts, and returns the top K.
+
+Now for windowed queries — last hour, last day, last month — we adjust the schema to include hourly timestamp buckets. Each row represents one video's view count for one hour. A "last day" query sums up the last 24 hourly buckets for each video and takes the top K.
+
+The problem is these aggregation queries get expensive fast at scale. That's where the deep dives come in.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> LB[Load Balancer]
+    LB --> API[API Gateway]
+    API --> TKS[Top-K Service]
+    TKS --> Cache[(Redis Cache)]
+    TKS --> DB[(Database)]
+    Kafka[Kafka View Events] --> CS[Consumer Service]
+    CS --> DB
+```
+
+**Data Flow:**
+1. **View ingestion**: Kafka → Consumer Service → Database (increment counters per video per hour bucket)
+2. **Top-K query**: Client → API Gateway → Top-K Service → Cache/Database → aggregated + sorted results[/DETAIL]
+--- SECTION: Deep Dive: Cut down on the number of queries to the database?
+[SAY]The lowest-hanging problem is that we're hitting the database for every top-K request, and these aggregation queries are expensive. But remember — our requirements give us a 1-minute grace period. We don't need real-time-to-the-second accuracy.
+
+I'd go with precomputation. We run a cron job every minute that computes the top K for each time window and writes the results to a Redis cache. Then every client request just reads from the cache — no database query at all on the hot path.
+
+This is better than a simple cache-aside pattern because cron gets ahead of expirations. With cache-aside, when a cache entry expires at a window boundary, you get a thundering herd of requests hitting the database. With precomputation, the cron job refreshes the cache before it expires, so there's never a cold cache in normal operation.
+
+The tradeoff is operational complexity — what if the cron job fails? But that's manageable with monitoring and fallback to direct database queries.[/SAY]
+[DETAIL]**Problem:** How can we cut down on the number of queries to the database?
+
+**Solution:** Great Solution: Precompute the Top K for each time window
+ApproachAnother approach we can utilize is to add a cron to our system which, on fixed intervals, will precompute the top K for each time window and warms our cache in the same way. Then, requests that come to our top-K service are only reading from the cache, never querying the database.Cron Top-KThis solves the problem of (b) in our "good" solution where we break our SLA around window boundaries when our cache expires. Because our cron job is running at fixed intervals, it has time to "get ahead" of the expirations that would have happened.ChallengesThe biggest problem with this approach is that it adds some operational complexity. What happens if the cron job fails? How do we monitor to ensure we're not very far behind? In the grander scheme of things, these are not the most important aspects of this particular design (we have a lot more to cover) so most interviewers aren't going to ask for additional details here.We can retain the cache entries for a couple hours to solve for the ...
+
+**Alternatives considered:**
+- (Good) Good Solution: Cache the Top K for each time window[/DETAIL]
+--- SECTION: Deep Dive: Handle the massive number of writes to the database?
+[SAY]Now let's talk about the write path. Let me actually do some quick math here because the numbers matter.
+
+Say we're handling 10 million views per second. Even with batching and hourly buckets, that's a huge number of upserts hitting the database. Postgres tops out at maybe 50-100k writes per second on a single instance with indexing. We're two orders of magnitude off.
+
+We have a few options. We can batch and aggregate in memory before writing — our consumer service accumulates counts for, say, 10 seconds, then flushes a single upsert per video. That reduces write volume dramatically. We can also shard by videoId across multiple database instances.
+
+But the real question is whether we even need a traditional database at all for this, which leads into the next deep dive on Flink.[/SAY]
+[DETAIL]**Problem:** How can we handle the massive number of writes to the database?[/DETAIL]
+--- SECTION: Deep Dive: Optimize our top K queries?
+[SAY]Even with precomputation handling the read path, the precompute job itself still needs to run expensive aggregation queries. For a "last day" query, we're summing 24 hourly buckets across potentially billions of videos and then sorting. That's heavy.
+
+The approach I'd go with is moving the aggregation into Flink, using its native distributed state management. Instead of writing to Postgres and then querying it, we keep the running aggregates in Flink's state, backed by RocksDB for overflow. Flink maintains per-video counters for each time window, updates them as view events stream in, and computes the top K continuously. Every minute, it writes the results directly to our Redis cache.
+
+This eliminates the database entirely for the hot path. No expensive aggregation queries, no cron jobs — Flink just continuously maintains the answer. The tradeoff is that Flink is complex infrastructure and requires some expertise to operate, but at this scale it's justified.[/SAY]
+[DETAIL]**Problem:** How do we optimize our top K queries?
+
+**Solution:** Great Solution: (With Caveats) Do Aggregation in Memory with Flink
+ApproachFor completeness, a final approach would be to keep the aggregates in Flink, using Flink's native distributed state management instead of reading and writing to the Views DB. We can use an external state storage, like RocksDB to move state off the heap onto disk so that it scales to the large size of data we're dealing with.By maintaining state inside of our Flink jobs, we can get rid of the Postgres database entirely. We can also have the top-K calculations performed natively in Flink, meaning we write the output directly to our Cache at the conclusion of every minute rather than requiring a top-K cron.Our Flink job would look something like this:public final class VideoTopKJob {
+ private static final int TOP_K = 100;
+ private static final List<WindowSpec> WINDOWS = List.of(
+ new WindowSpec("last_hour", java.time.Duration.ofHours(1)),
+ new WindowSpec("last_day", java.time.Duration.ofDays(1)),
+ new WindowSpec("last_month", java.time.Duration.ofDays(30))
+ );
+
+ private VideoTopKJ...
+
+**Alternatives considered:**
+- (Good) Good Solution: Aggregate at a Coarser Granularity[/DETAIL]
+--- SECTION: Deep Dive: What if we need to support sliding windows?
+[SAY]So far we've been working with tumbling windows — fixed boundaries like "the hour from 9:00 to 10:00." But what if the interviewer asks about sliding windows, where a query at 10:06 should give views from 9:06 to 10:06?
+
+The approach builds on our per-hour aggregates. To track the last hour with a sliding window, when a new minute's batch comes in we increase by that minute's views and decrease by the views from 60 minutes ago. It's essentially a running sum that slides forward.
+
+The tricky part is that we need to keep minute-level granularity to slide accurately, which means more rows in our aggregation table. But the core pattern is the same — maintain the aggregate incrementally rather than recomputing from scratch each time.[/SAY]
+[DETAIL]**Problem:** What if we need to support sliding windows?[/DETAIL]
+--- SECTION: Deep Dive: Can we make use of approximations to improve performance?
+[SAY]Our requirements say precise counts, but if the interviewer relaxes that constraint, we can get a massive efficiency win. The insight is that the top videos differ by thousands or millions of views — the ranking almost never comes down to a handful of views. So a small approximation error doesn't change the result.
+
+The data structure for this is Count-Min Sketch. CMS uses hash functions to map video IDs into a 2D array of counters. It uses hundreds of megabytes instead of the hundreds of gigabytes a full hash table would need. The tradeoff is it can overcount slightly but never undercount.
+
+I'd implement this in Flink — the CMS and a sorted list for the current top K both live in Flink's in-memory state, checkpointed for durability. If a node goes down, Flink restores from a checkpoint and replays from Kafka. No external infrastructure needed beyond what we already have. The diagram barely changes, but memory usage drops by orders of magnitude.[/SAY]
+[DETAIL]**Problem:** Can we make use of approximations to improve performance?
+
+**Solution:** Great Solution: Flink
+ApproachIf we're using a Flink-based approach, the CMS and the sorted list can both be maintained in Flink's state management in memory (checkpointed by Flink to avoid losing state). This is just custom code we're writing into our job rather than additional infra we're deploying, so our diagram largely looks the same!Flink CMS Top-KIf a node goes down, Flink allows us to restore from a checkpoint and replay our state from the events in the Kafka stream.This approach is more resilient to failures than the Redis approach and more efficient because the data structure is kept in memory.ChallengesLike earlier Flink-based solutions, this approach will require both that (a) your interviewer understands enough about Flink to understand the proposal, and (b) you're able to go into detail about how each of the pieces works at a lower level. Expect to spend some time talking about the job structure, how state is managed, etc.
+
+**Alternatives considered:**
+- (Good) Good Solution: Redis[/DETAIL]
+--- SECTION: Deep Dive: Is there room for a specialized database here?
+[SAY]It's worth briefly mentioning specialized databases since this is a natural use case. Real-time OLAP databases like Druid, Pinot, or ClickHouse are built for exactly this kind of workload — ingest from Kafka, roll up per-minute by videoId, and serve topN queries over time filters.
+
+Each has a slightly different approach. Druid does ingestion-time rollups. Pinot uses star-tree indexes for pre-aggregated queries. ClickHouse uses materialized views with SummingMergeTree tables for rollups on ingest.
+
+That said, I'd be careful reaching for specialized tech in an interview unless I can explain how it works under the hood. The interviewer may not be familiar with the specific database, and they'll want to see that I understand the underlying primitives — precomputation, partitioning, rollups — rather than just name-dropping a product. If I can build the solution from first principles, then mentioning the specialized tool as a production shortcut is a nice bonus.[/SAY]
+[DETAIL]**Problem:** Is there room for a specialized database here?
+
+**Solution:** Good Solution: Real-time OLAP (Druid/Pinot/ClickHouse)
+ApproachThe last approach is to use a real-time OLAP database. Ingest from Kafka, roll up per-minute byvideoId, and query with topN/groupBy over a time filter. These all have a different way to do the same thing: pre-aggregate the data on ingest.Each of these systems has a different approach to these pre-aggregations:Druid: Ingestion-time rollup groups by a time bucket (e.g., minute) andvideoId, applyingcountaggregators so segments store pre-summed rows. Background compaction can re-rollup older data at coarser grains (hour/day) to speed long-window queries.Pinot:Star-tree indexesand materialized views pre-aggregate metrics, so for fixed patterns like top-K byvideoIdover a window, star-trees prune most data and serveGROUP BY ... ORDER BY ... LIMIT Kquickly. You can also generate offline pre-aggregated segments (minute/hour/day) and query the right table per window.ClickHouse: UseMaterialized VIEW→SummingMergeTree/AggregatingMergeTreetables to maintain per-minute/hour/day rollups on ing...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: InfluxDB or Prometheus (time-series engine with downsampling)
+- (Good) Good Solution: TimescaleDB (Postgres + hypertables + continuous aggregates)
+- (Good) Good Solution: Real-time OLAP (Druid/Pinot/ClickHouse)[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For reducing database queries, we chose precomputation over simple caching — adds a cron job to manage, but eliminates thundering herd problems at window boundaries. For optimizing the aggregation itself, Flink's in-memory state management over database-side aggregation — significantly more complex infrastructure, but eliminates the database from the hot path entirely and handles the write throughput we need. And if we can relax the precision requirement, Count-Min Sketch in Flink drops memory usage by orders of magnitude with negligible impact on ranking accuracy.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Why |
+| --- | --- | --- | --- |
+| How can we cut down on the number of queries to th | Great Solution: Precompute the Top K for each time window | Good Solution: Cache the Top K for each time window | Better scalability and reliability |
+| How do we optimize our top K queries? | Great Solution: (With Caveats) Do Aggregation in Memory with Flink | Good Solution: Aggregate at a Coarser Granularity | Better scalability and reliability |[/DETAIL]
+[/SYSDESIGN]

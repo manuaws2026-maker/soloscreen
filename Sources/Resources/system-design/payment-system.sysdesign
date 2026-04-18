@@ -1,0 +1,197 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for a payment processing system — this is a big one. Let me start with the requirements.
+
+For the functional requirements, the core things: first, merchants need to be able to initiate payment requests — basically creating a payment intent when a customer hits checkout. Second, users should be able to pay with credit or debit cards, so we need to securely collect and process card details. Third, merchants need reliable status updates on their payments — succeeded, failed, pending.
+
+For non-functional requirements — security is paramount, we're handling card data so PCI-DSS compliance is non-negotiable. Durability — we can never lose transaction data, that would be a financial and legal disaster. Transaction safety — we need to handle the asynchronous nature of payment networks without double-charging or dropping payments. And scalability to handle 10,000+ transactions per second.
+
+Below the line: multi-currency support, refund flows, dispute handling, and subscription billing.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Merchants can initiate payment requests (create PaymentIntents)
+2. System securely accepts and processes credit/debit card payments
+3. System provides reliable payment status updates to merchants
+
+**Non-Functional Requirements:**
+- Security: PCI-DSS compliant handling of card data
+- Durability: zero tolerance for lost transaction data, complete audit trail
+- Transaction safety: no double-charges, no dropped payments despite async payment networks
+- Scalability: 10,000+ TPS
+- Consistency: strong consistency for payment state transitions
+
+**Below the Line (Out of Scope):**
+- Multi-currency support and FX conversion
+- Refund and dispute flows
+- Subscription/recurring billing
+- Merchant onboarding and KYC[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Let me define the core entities. We've got three main ones.
+
+A Merchant stores info about the business using our platform — identity, bank account details, API keys. A PaymentIntent represents the merchant's intention to collect a specific amount from a customer. It owns the state machine — created, authorized, captured, canceled, refunded — and enforces idempotency for retries. This is a key design choice borrowed from Stripe — separating the intent from the actual money movement.
+
+A Transaction is a polymorphic money-movement record linked to a PaymentIntent. Types include Charge, Refund, Dispute, and Payout. For our scope we're focused on Charges. Important detail: if a payment fails and the merchant retries with the same PaymentIntent, a new Transaction is created. Multiple transactions can be linked to one intent — this handles partial payments and retries cleanly.[/SAY]
+[DETAIL]- **Merchant:** This entity will store information about the businesses using our payment platform, including their identity details, bank account information, and API keys.
+- **PaymentIntent:** This represents the merchant's intention to collect a specific amount from a customer and tracks the overall payment lifecycle from creation to completion. It owns the state machine from created → authorized → captured / canceled / refunded, and enforces idempotency for retries.
+- **Transaction:** This represents a polymorphic money-movement record linked back to one PaymentIntent. Types include Charge (funds in), Refund (funds out), Dispute (potential reversal), and Payout (merchant withdrawal). Each row carries amount, currency, status, timestamps, and references to both the intent and the merchant. For simplicity, we'll only be focused on Charges as everything else is out of scope.
+- If a payment attempt fails due to insufficient funds, the merchant might retry with the same PaymentIntent ID but a different Transaction will be created.
+- For partial payments, multiple Transactions might be linked to the same PaymentIntent.
+- For refunds, a new Transaction with a negative amount would be created and linked to the original PaymentIntent.[/DETAIL]
+--- SECTION: API Design
+[SAY]Here are the key endpoints. POST /payment-intents to create a new payment intent — takes the amount in cents, currency, and a description. Returns a paymentIntentId that the merchant uses for everything after.
+
+POST /payment-intents/:id/transactions to actually process a payment. This takes card details — though in practice we'd use tokenization, never raw card numbers. I'd call that out but not go deep on it yet since we'll cover security in the deep dives.
+
+GET /payment-intents/:id for merchants to check payment status. And optionally, we'd support webhooks — the merchant provides a callback URL and we POST events to it when status changes. That way merchants don't have to poll.[/SAY]
+[DETAIL]The API is the main way merchants will interact with our payment system. Defining it early helps us structure the rest of our design. We'll start simple and, as always, we can add more detail as we go. I'll just create one endpoint for each of our core requirements.
+First, merchants need to initiate PaymentIntent requests. This will happen when a customer reaches the checkout page of a merchant's website. We'll use a `POST` request to create the PaymentIntent.
+Next, the system needs to securely accept and process payments. Since we're focusing on credit/debit cards initially, we'll need an endpoint for that:
+In a real implementation, we'd never pass raw card details directly to our backend like this. We'd use a secure tokenization process to protect sensitive data. We'll get into the details of how we handle this securely when we get further into our design. In your interview, I would just callout that you understand this data will need to be encrypted.
+Finally, merchants need to check the status of payments. This can be done with a simple `GET` request like so:
+The response would include the payment's current status (e.g., "pending", "succeeded", "failed") and any relevant details like error messages for failed payments.
+For a more real-time approach (and one that actually mirrors the industry standard), we could also provide webhooks that notify merchants when payment statuses change. In this way, the merchant would provide us with a callback URL that we would POST to when the payment status changes, allowing them to get real-time updates on the status of their payments.
+Designing a webhook callback system is often a standalone question in system design interviews. Designing a payment system, complete with webhooks, would be a lot to complete in the time allotted. Have a discussing with your interviewer early on so you're on the same page about what you're building.
+
+```
+POST /payment-intents -> paymentIntentId
+{
+ "amountInCents": 2499,
+ "currency": "usd",
+ "description": "Order #1234",
+}
+```
+
+```
+POST /payment-intents/{paymentIntentId}/transactions
+{
+ "type": "charge",
+ "card": {
+ "number": "4242424242424242",
+ "exp_month": 12,
+ "exp_year": 2025,
+ "cvc": "123"
+ }
+}
+```
+
+```
+GET /payment-intents/{paymentIntentId} -> PaymentIntent
+```
+
+```
+POST {merchant_webhook_url}
+{
+ "type": "payment.succeeded",
+ "data": {
+ "paymentId": "pay_123",
+ "amountInCents": 2499,
+ "currency": "usd",
+ "status": "succeeded"
+ }
+}
+```[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, PostgreSQL is the obvious choice here — we need ACID transactions for payment state transitions. Can't have a race condition that double-charges someone. We'd have tables for Merchants, PaymentIntents, and Transactions, with foreign keys enforcing the relationships. I'd also add Kafka for our event stream, which I'll cover in the durability deep dive.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through this one requirement at a time.
+
+For initiating payments, the merchant's server calls our API Gateway, which routes to a Payment Service. The Payment Service creates a PaymentIntent record in Postgres and returns the ID.
+
+For processing payments, the customer's card details come through — ideally via a secure iframe, but we'll cover that in deep dives. The Payment Service creates a Transaction record, then calls out to the payment network — Visa, Mastercard, the issuing bank. This is inherently async — the authorization might come back instantly or take seconds.
+
+For status updates, the Payment Service tracks state transitions in Postgres. Merchants can poll via GET, or we push updates via webhooks. The async nature of payment networks is the central challenge — we need to handle timeouts, retries, and partial failures gracefully without ever losing data or double-charging.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> LB[Load Balancer]
+    LB --> API[API Gateway]
+    API --> OurTransaction[Our Transaction Service]
+    API --> Payment[Payment Service]
+    API --> InOne[In One Service]
+    API --> APaymentintent[A Paymentintent Service]
+    API --> Transaction[Transaction Service]
+    Transaction --> Database[(Database)]
+```
+
+**Data Flow:**
+1. 1) Merchants should be able to initiate payment requests
+2. 2) Users should be able to pay for products with credit/debit cards.
+3. 3) The system should provide status updates for payments[/DETAIL]
+--- SECTION: Deep Dive: The system should be highly secure
+[SAY]Security for payments comes down to two questions: is the merchant who they say they are, and are we protecting customer card data?
+
+For merchant authentication, API keys with rate limiting — standard stuff. The more interesting problem is card data.
+
+I'd use an iframe-plus-encryption approach. The merchant embeds our JavaScript SDK on their checkout page, which renders a secure iframe for the card form. The card details never touch the merchant's servers at all. Inside the iframe, our SDK encrypts the card data with our public key before it leaves the browser. So even if the merchant's site is compromised, the attacker only gets encrypted data they can't decrypt.
+
+The encrypted payload goes over HTTPS to our servers, where we decrypt it using our private key stored in Hardware Security Modules. This multi-layer approach means the card number is encrypted client-side, encrypted in transit via TLS, and only decrypted inside our secure infrastructure. The merchant never sees raw card data, which keeps them out of PCI scope.[/SAY]
+[DETAIL]**Problem:** The system should be highly secure
+
+**Solution:** Great Solution: iFrame + Encryption
+ApproachThe most secure approach builds upon the iframe solution while addressing its limitations through multiple layers of security. Our payment system generates and manages encryption keypairs, and our JavaScript SDK utilizes our public key for encryption.When a customer enters their card details in our iframe, our JavaScript SDK immediately encrypts the data using this public key before it even leaves their device. This means the card data never exists in an unencrypted form outside the customer's browser. Even if the merchant's site is compromised, the attacker would only get encrypted data that they cannot decrypt.The encrypted data is then transmitted over HTTPS to our servers, where we use the corresponding private key (securely stored in Hardware Security Modules) to decrypt it. While HTTPS provides transport security, it's now protecting already-encrypted data, adding an extra layer of protection.This multi-layered approach means that even if one security mechanism fails (e.g...
+
+**Alternatives considered:**
+- (Good) Good Solution: Basic API Key Authentication
+- (Bad) Bad Solution: Server-Side Payment Data Collection
+- (Good) Good Solution: Client-Side iFrame Isolation[/DETAIL]
+--- SECTION: Deep Dive: The system should guarantee durability and auditability w...
+[SAY]For payments, losing transaction data is catastrophic — financially and legally. We need a complete, immutable record of every payment attempt, success, and failure. Six months later when a customer disputes a charge, we need to prove exactly what happened.
+
+I'd use Change Data Capture on our Postgres database, streaming every write into Kafka as an immutable event log. CDC monitors the write-ahead log at the database level — not the application level — so we're guaranteed to capture every committed change. No application bug can cause us to miss an event.
+
+Kafka becomes our append-only audit trail. From there, specialized consumers handle different needs: one archives to cold storage for compliance, another feeds the reconciliation service, another powers the webhook system.
+
+The beauty of this approach is separation of concerns. The operational database stays optimized for current-state queries. The event stream handles audit, replay, and downstream processing. And because CDC captures at the database level, we get durability guarantees that application-level event publishing can't match.[/SAY]
+[DETAIL]**Problem:** The system should guarantee durability and auditability with no transaction data ever being lost, even in case of failures.
+
+**Solution:** Great Solution: Database + Change Data Capture + Event Stream
+ApproachA more robust approach, used by payment processors like Stripe, separates operational and audit concerns while guaranteeing consistency between them. We still use a traditional database for merchant-facing operations, but audit durability comes from an immutable event stream populated via Change Data Capture (CDC).Here's how it works:Operational Database: Handles merchant API requests with optimized tables for current state queries. No audit tables needed—just pure operational data models.Change Data Capture: Monitors the database's write-ahead log (WAL) or oplog, capturing every committed change as an event. This happens at the database level, not application level, guaranteeing we never miss changes.Immutable Event Stream: CDC publishes all changes to Kafka, creating an append-only log of every state transition. Events are keyed by payment_intent_id and include the full before/after state.Specialized Consumers: Different services consume the event stream for their specific ne...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Single Database with Current State Only
+- (Good) Good Solution: Separate Audit Tables[/DETAIL]
+--- SECTION: Deep Dive: The system should guarantee transaction safety and financ...
+[SAY]This is the hardest part of payment systems. When we call Visa to authorize a charge, we're crossing into systems we don't control. A timeout doesn't mean the charge failed — it might still be processing. If we naively retry, we double-charge the customer. If we assume failure, the charge might go through and the merchant never ships the product.
+
+The key insight is to record our intention before acting. Before calling the payment network, we write an attempt record to the database — which network, what reference ID, what we're trying to do. This triggers a CDC event capturing our intention.
+
+Then we make the network call. If it succeeds, great — update the record. If it times out, we mark it as "timeout" and the reconciliation service picks it up. We run a periodic reconciliation job that compares our records against the payment network's records and resolves any discrepancies.
+
+For preventing double-charges specifically, we use idempotency keys. Every charge attempt gets a unique key that the payment network uses to deduplicate. If our retry hits the network with the same key, the network returns the original result instead of processing a new charge. This makes retries safe.[/SAY]
+[DETAIL]**Problem:** The system should guarantee transaction safety and financial integrity despite the inherently asynchronous nature of external payment networks
+
+**Solution:** Great Solution: Event-Driven Safety with Reconciliation
+ApproachThe most robust approach leverages the CDC and event stream infrastructure we established for durability, treating asynchronous payment networks as first-class citizens in our architecture.The key insight is to track our intentions before acting on them. Here's how the complete flow works:Record the attempt: Before calling any payment network, we write an attempt record to our database with the network name, reference ID, and what we're trying to accomplish. This triggers a CDC event capturing our intention.Call the payment network: We send the actual charge request with our configured timeout.Handle the response(branching based on outcome):Success: Update the attempt status to "succeeded" in the database, which triggers another CDC event with the successful outcomeTimeout: Update the attempt status to "timeout" in the database, triggering a CDC event that the reconciliation service will processExplicit failure: Update the attempt status to "failed" with the failure reasonAutom...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Assume Timeouts Mean Failure
+- (Good) Good Solution: Pending States with Manual Reconciliation[/DETAIL]
+--- SECTION: Deep Dive: The system should be scalable to handle high transaction ...
+[SAY]Alright, now for scale. Let me work through the system left to right.
+
+Our services are all stateless, so they scale horizontally behind load balancers — that's table stakes, no need to dwell on it.
+
+For Kafka — at 10k TPS, we need to think about partitioning. A single Kafka partition typically handles 5-10k messages per second. So 3-5 partitions with a replication factor of 3 gives us comfortable headroom. We'd partition by payment_intent_id to maintain ordering per payment.
+
+For the database, 10k TPS of writes is significant for Postgres. I'd shard by merchant_id since most queries are merchant-scoped. Read replicas handle the query load for status checks. And connection pooling with something like PgBouncer keeps connection overhead manageable.
+
+The payment network calls are actually the main bottleneck — those are external and have fixed latency. We handle this with a large pool of async workers, so we're always saturating the network's capacity without blocking our own processing pipeline.[/SAY]
+[DETAIL]**Problem:** The system should be scalable to handle high transaction volume (10,000+ TPS)[/DETAIL]
+--- SECTION: Deep Dive: Expand the design to support Webhooks?
+[SAY]So webhooks are how we proactively notify merchants about payment events — succeeded, failed, disputed. Merchants give us a callback URL and a signing secret.
+
+When a payment status changes, we publish a webhook event. A webhook delivery service picks it up, signs the payload with the merchant's secret so they can verify authenticity, and POSTs it to their URL.
+
+The tricky part is reliability. Merchant servers go down, so we need retry logic with exponential backoff — try immediately, then 5 minutes, then 30 minutes, up to 24 hours. We store every delivery attempt for debugging. And merchants need an API to query missed events in case their server was down and they want to catch up.
+
+This is really its own system design problem — we're just sketching the high-level approach here. The CDC event stream we already have provides the perfect input for the webhook system since every state change is already captured as an event.[/SAY]
+[DETAIL]**Problem:** How can we expand the design to support Webhooks?[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For security, we chose the iframe-plus-encryption approach — it adds SDK complexity for merchants but keeps them entirely out of PCI scope, which is a massive win. For durability, CDC plus Kafka over simple audit tables — significantly more infrastructure, but we get guaranteed capture of every database change and decoupled downstream consumers. For transaction safety, event-driven reconciliation over assuming timeouts mean failure — more complex, but the only safe approach when dealing with external payment networks where silence doesn't mean failure. And the separation of operational database from the event stream adds operational overhead but gives us independent scaling and a clean separation of concerns.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Why |
+| --- | --- | --- | --- |
+| The system should be highly secure | Great Solution: iFrame + Encryption | Good Solution: Client-Side iFrame Isolation | Better scalability and reliability |
+| The system should guarantee durability and auditab | Great Solution: Database + Change Data Capture + Event Stream | Good Solution: Separate Audit Tables | Better scalability and reliability |
+| The system should guarantee transaction safety and | Great Solution: Event-Driven Safety with Reconciliation | Good Solution: Pending States with Manual Reconciliation | Better scalability and reliability |[/DETAIL]
+[/SYSDESIGN]

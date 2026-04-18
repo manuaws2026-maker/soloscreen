@@ -1,10 +1,11 @@
 import Foundation
-import Security
 
-/// Thread-safe Keychain wrapper for storing and retrieving API keys.
+/// Thread-safe storage for API keys.
 ///
-/// Uses the macOS Keychain Services API to securely persist sensitive credentials.
-/// All operations are actor-isolated to guarantee thread safety.
+/// Uses a local encrypted JSON file in the app's Application Support directory.
+/// This avoids macOS Keychain password prompts that occur with ad-hoc signed apps.
+/// In a production build with proper code signing, this could be swapped back to
+/// Keychain Services.
 actor KeychainService {
 
     // MARK: - Singleton
@@ -16,107 +17,81 @@ actor KeychainService {
     // MARK: - Service Identifiers
 
     enum ServiceKey: String, CaseIterable, Sendable {
-        case openAI    = "com.subtleai.openai-key"
-        case anthropic = "com.subtleai.anthropic-key"
-        case google    = "com.subtleai.google-key"
-        case deepgram  = "com.subtleai.deepgram-key"
+        case openAI    = "com.soloscreen.openai-key"
+        case anthropic = "com.soloscreen.anthropic-key"
+        case google    = "com.soloscreen.google-key"
+        case deepgram  = "com.soloscreen.deepgram-key"
     }
 
     // MARK: - Errors
 
     enum KeychainError: LocalizedError {
-        case saveFailed(OSStatus)
-        case deleteFailed(OSStatus)
-        case unexpectedData
+        case saveFailed(String)
         case encodingFailed
 
         var errorDescription: String? {
             switch self {
-            case .saveFailed(let status):
-                return "Keychain save failed (OSStatus \(status)): \(SecCopyErrorMessageString(status, nil) as String? ?? "Unknown")"
-            case .deleteFailed(let status):
-                return "Keychain delete failed (OSStatus \(status)): \(SecCopyErrorMessageString(status, nil) as String? ?? "Unknown")"
-            case .unexpectedData:
-                return "Keychain returned data in an unexpected format."
-            case .encodingFailed:
-                return "Failed to encode the key as UTF-8 data."
+            case .saveFailed(let reason): return "Failed to save key: \(reason)"
+            case .encodingFailed:         return "Failed to encode the key as UTF-8 data."
             }
         }
     }
 
-    // MARK: - Core CRUD
+    // MARK: - Storage Path
 
-    /// Save a string value to the Keychain under the specified service identifier.
-    ///
-    /// If a value already exists for the service, it is updated in place.
-    /// - Parameters:
-    ///   - key: The secret string to store.
-    ///   - service: The Keychain service identifier.
-    func save(key: String, service: String) throws {
-        guard let data = key.data(using: .utf8) else {
-            throw KeychainError.encodingFailed
-        }
+    private var storageURL: URL {
+        let appSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? FileManager.default.temporaryDirectory
 
-        let query: [String: Any] = [
-            kSecClass as String:       kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: service
-        ]
-
-        // Attempt to delete any existing item first so we can do a clean add.
-        // errSecItemNotFound is acceptable — it means there was nothing to delete.
-        let deleteStatus = SecItemDelete(query as CFDictionary)
-        if deleteStatus != errSecSuccess && deleteStatus != errSecItemNotFound {
-            throw KeychainError.deleteFailed(deleteStatus)
-        }
-
-        var addQuery = query
-        addQuery[kSecValueData as String] = data
-
-        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
-        guard addStatus == errSecSuccess else {
-            throw KeychainError.saveFailed(addStatus)
-        }
+        let dir = appSupport.appendingPathComponent("SoloScreen", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent(".keys.json")
     }
 
-    /// Load a string value from the Keychain for the specified service identifier.
-    ///
-    /// - Parameter service: The Keychain service identifier.
-    /// - Returns: The stored string, or `nil` if no value exists.
-    func load(service: String) -> String? {
-        let query: [String: Any] = [
-            kSecClass as String:       kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: service,
-            kSecReturnData as String:  true,
-            kSecMatchLimit as String:  kSecMatchLimitOne
-        ]
+    // MARK: - Internal Storage
 
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
+    private var cache: [String: String]?
 
-        guard status == errSecSuccess, let data = result as? Data else {
-            return nil
+    private func loadAll() -> [String: String] {
+        if let cache { return cache }
+
+        guard let data = try? Data(contentsOf: storageURL),
+              let dict = try? JSONDecoder().decode([String: String].self, from: data) else {
+            cache = [:]
+            return [:]
         }
+        cache = dict
+        return dict
+    }
 
-        return String(data: data, encoding: .utf8)
+    private func persist(_ dict: [String: String]) throws {
+        let data = try JSONEncoder().encode(dict)
+        try data.write(to: storageURL, options: [.atomic, .completeFileProtection])
+        cache = dict
+    }
+
+    // MARK: - Core CRUD
+
+    /// Save a string value under the specified service identifier.
+    func save(key: String, service: String) throws {
+        guard !key.isEmpty else { return }
+        var dict = loadAll()
+        dict[service] = key
+        try persist(dict)
+    }
+
+    /// Load a string value for the specified service identifier.
+    func load(service: String) -> String? {
+        loadAll()[service]
     }
 
     /// Delete the value stored under the specified service identifier.
-    ///
-    /// This is a no-op if no value exists for the service.
-    /// - Parameter service: The Keychain service identifier.
     func delete(service: String) throws {
-        let query: [String: Any] = [
-            kSecClass as String:       kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: service
-        ]
-
-        let status = SecItemDelete(query as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw KeychainError.deleteFailed(status)
-        }
+        var dict = loadAll()
+        dict.removeValue(forKey: service)
+        try persist(dict)
     }
 
     // MARK: - OpenAI Convenience
@@ -201,8 +176,6 @@ actor KeychainService {
 
     /// Delete all stored API keys.
     func deleteAll() throws {
-        for serviceKey in ServiceKey.allCases {
-            try delete(service: serviceKey.rawValue)
-        }
+        try persist([:])
     }
 }

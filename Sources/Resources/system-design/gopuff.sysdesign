@@ -1,0 +1,104 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for GoPuff — this is essentially an instant delivery platform where users order everyday items and get them delivered from local distribution centers within an hour.
+
+For functional requirements — first, customers need to be able to query item availability by their location. Second, customers need to be able to place orders for available items.
+
+For non-functional requirements — availability lookups need to be fast, under 100ms, since they power the search and browsing experience. Ordering needs strong consistency — two customers absolutely cannot purchase the same physical item. We need to support 10,000 distribution centers and 100,000 items in the catalog. And order volume will be around 10 million orders per day.
+
+Below the line for now: privacy and security, and disaster recovery.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Customers can query availability of items by location
+2. Customers can place orders for available items
+
+**Non-Functional Requirements:**
+- Low-latency availability lookups: < 100ms to support search use cases
+- Strong consistency on ordering: no two customers can purchase the same physical item
+- Scale: 10K distribution centers, 100K items in catalog
+- Order volume: ~10M orders/day
+
+**Below the Line (Out of Scope):**
+- Privacy and security
+- Disaster recovery[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Let me define the core entities. We've got four.
+
+Inventory is a physical instance of an item at a specific distribution center. We sum up inventory to determine how many of a given item are available to a user. An Item is a type of product — like Cheetos. This is what customers actually browse and search for.
+
+A DistributionCenter is a physical location where items are stored. We use these to figure out what's available to a user based on proximity. And an Order is a collection of inventory items that a customer has purchased, along with shipping and billing info.[/SAY]
+[DETAIL]- **Inventory** : A physical instance of an item, located at a DC. We'll sum up Inventory to determine the quantity available to a specific user for a specific `Item` .
+- **Item** : A type of item, e.g. Cheetos. These are what our customers will actually care about.
+- **DistributionCenter** : A physical location where items are stored. We'll use these to determine which items are available to a user. `Inventory` are stored in DCs.
+- **Order** : A collection of `Inventory` which have been ordered by a user (and shipping/billing information).[/DETAIL]
+--- SECTION: API Design
+[SAY]Okay so we really only need two endpoints here, and I want to keep them simple.
+
+First, a GET to /availability that takes a location, an optional keyword, and pagination params. This returns available items near the user. Second, a POST to /orders with the items and the user's location to place an order.
+
+One thing to note — we pass location to both endpoints. For availability, it determines which distribution centers to check. For ordering, we need to confirm the inventory is actually close enough to deliver within an hour before we process the order.[/SAY]
+[DETAIL]Next, we can start with the APIs we need to satisfy, which should track closely to our functional requirements. There are a lot of extraneous details we could shove into these APIs, but we're going to start simple to avoid burning unnecessary time in the interview (a common mistake in practice!).
+To meet our requirements we only need two APIs: the first API allows us to get availability of items given a location (and maybe a keyword), and the second API allows us to place an order. We'll include pagination in our availability API to avoid overwhelming the client with more data than it needs.
+API
+Note here that we're passing our location to both APIs: before the order can be processed by the backend we'll need to confirm the inventory is available close enough to the user's location to deliver within 1 hour.[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, I'd use PostgreSQL for everything — inventory, items, distribution centers, orders. We need strong consistency for order processing where we're decrementing inventory atomically, and ACID transactions make that straightforward.
+
+We might look at read replicas later for the availability queries since those can tolerate slight staleness, but for now Postgres is the right starting point.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through this one requirement at a time.
+
+For availability queries — there are two steps. First, we need to find distribution centers close enough to deliver within an hour. All inventory lives in a DC, so finding nearby DCs lets us skip checking every item in the system. Second, once we have the nearby DCs, we query their inventory and return the union to the user. Both steps need to be fast since our end-to-end target is under 100ms.
+
+For placing orders — this is where strong consistency matters. We need to check inventory, create the order record, and decrement inventory all atomically. We can't have two users ordering the same last item. So this needs to be a database transaction. Latency is less critical here — users will tolerate a bit more wait on checkout than on browsing.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> LB[Load Balancer]
+    LB --> API[API Gateway]
+    API --> TheAvailability[The Availability Service]
+    API --> TheNearby[The Nearby Service]
+    API --> TravelTime[Travel Time Service]
+    API --> Nearby[Nearby Service]
+    API --> PrimitiveNearby[Primitive Nearby Service]
+    PrimitiveNearby --> Database[(Database)]
+    PrimitiveNearby --> PostgreSQL[(PostgreSQL)]
+```
+
+**Data Flow:**
+1. 1) Customers should be able to query availability of items
+2. 2) Customers should be able to order items.[/DETAIL]
+--- SECTION: Deep Dive: Make availability lookups incorporate traffic and drive time
+[SAY]So right now we're finding nearby DCs based on simple distance, but that's not good enough. A DC across a river might be 5 miles away but 45 minutes in drive time. And traffic changes throughout the day. Since our requirement is one-hour delivery, we need actual drive time estimates, not just distance.
+
+The approach I'd go with is a two-step filter. First, we keep all DC locations synced in memory on our Nearby Service — there are only 10,000 of them, so that's trivial. When a request comes in, we do a quick radius filter — say 60 miles, the most optimistic distance you could drive in an hour — to get candidate DCs. This prunes the list down fast.
+
+Then we pass just those candidates to an external travel time estimation service to get actual drive time accounting for traffic. This way we only make a handful of travel time API calls per request instead of checking all 10,000 DCs. The in-memory radius filter is essentially free, and the travel time calls are the expensive part we're minimizing.[/SAY]
+[DETAIL]**Problem:** Make availability lookups incorporate traffic and drive time
+
+**Solution:** Great Solution: Use a Travel Time Estimation Service Against Nearby DCs
+We build on the previous solution to sync periodically (like every 5 minutes) from a DC table to memory of our service. When an input comes in, we can prune down the "candidate" DCs by taking a fixed radius (say 60 miles, the most optimistic distance we could drive over in 1 hour) and limiting ourselves to only evaluating those. We'll take these restricted candidates and then pass to the external travel time service to create our final estimate.Travel Time Against Nearby DCs
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Simple SQL Distance
+- (Bad) Bad Solution: Use a Travel Time Estimation Service Against all DCs[/DETAIL]
+--- SECTION: Deep Dive: Make availability lookups fast and scalable
+[SAY]Once we've found nearby DCs, we're querying the database directly for inventory. Let me think about whether that's going to hold up at scale.
+
+Working backward from our 10 million orders per day — each user probably browses 10 pages before purchasing, and maybe only 5% of browsers actually buy. That gives us roughly 2 billion availability reads per day, or about 25,000 reads per second. That's a lot of load on Postgres.
+
+The key insight is that availability queries are always scoped to a small set of nearby DCs. So we can partition inventory by region — using the first 3 digits of the DC's zip code as the partition key. Now each query only hits one or two partitions instead of scanning the full inventory table.
+
+On top of that, we can use read replicas for availability queries since we can tolerate slight staleness — if an item shows as available but got bought 2 seconds ago, we'll catch it at checkout time with our strongly consistent order transaction. Orders themselves still go to the Postgres leader for full consistency.[/SAY]
+[DETAIL]**Problem:** Make availability lookups fast and scalable
+
+**Solution:** Great Solution: Postgres Read Replicas and Partitioning
+ApproachSince we only ever read inventory from a nearby collection of DC's, we can group them together with a region ID using the first 3 digits of their zipcode. Then we can partition our inventory based on this region IDs. This means all queries will go to mostly 1 or 2 partitions rather than the entire inventory dataset.We can also use read replicas for availability since we can tolerate a small amount of inconsistency. Our orders need to be strongly consistent, so those transactions need to be sent to the Postgres leader, but our availability queries can go to our read replicas.Postgres Read Replicas and PartitioningChallengesWe'll need to manage the sizing of our replicas to balance with traffic. We'll also need to manage the partitioning of our data to ensure that we're not overloading any one replica.[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For drive time estimation, we chose a two-step approach — in-memory radius filter plus targeted travel time API calls — over querying the travel time service for all DCs. More complexity in the filtering logic, but we go from 10,000 API calls to maybe 5-10 per request. For availability scaling, read replicas with partitioning over a single Postgres instance. We trade some operational complexity — managing replicas and partition strategy — for the ability to handle 25,000 reads per second. And availability reads can be slightly stale while orders remain strongly consistent against the leader.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Why |
+| --- | --- | --- | --- |
+| Make availability lookups incorporate traffic and | Great Solution: Use a Travel Time Estimation Service Against Nearby DCs | Bad Solution: Use a Travel Time Estimation Service Against all DCs | Better scalability and reliability |
+| Make availability lookups fast and scalable | Great Solution: Postgres Read Replicas and Partitioning | Simple approach | Better scalability and reliability |[/DETAIL]
+[/SYSDESIGN]

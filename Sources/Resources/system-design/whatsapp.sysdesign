@@ -1,0 +1,247 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for WhatsApp let me start with the functional requirements — the core things we need to build.
+
+First, users need to send and receive messages in real time with low latency — under 500ms delivery. Second, we need to guarantee message delivery — if someone sends a message, it has to reach the recipient even if they're offline right now. Third, we need group chats supporting up to 100 participants. And fourth, users should be able to send media — images, videos, documents.
+
+For non-functional requirements — we're targeting billions of users with high throughput. Messages should be stored on our servers only as long as necessary for delivery, not permanently. And the system needs to handle users with multiple devices.
+
+Things I'm putting below the line for now: end-to-end encryption details, spam prevention, and read receipts.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Users can send/receive text messages with low latency (< 500ms)
+2. Guaranteed message delivery — messages reach recipients even if offline (up to 30 days)
+3. Group chats with up to 100 participants
+4. Users can send/receive media (images, videos, documents)
+
+**Non-Functional Requirements:**
+- Scale: 2B+ registered users, ~200M concurrent connections
+- High throughput: billions of messages per day
+- Minimal server-side message retention — deliver and discard
+- Multi-device support per user
+
+**Below the Line (Out of Scope):**
+- End-to-end encryption implementation details
+- Spam and scraping prevention
+- Read receipts and typing indicators[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Let me define the core entities. We've got four.
+
+A User represents someone registered in the system. A Chat is a conversation — could be between two people or a group of up to 100. A Message belongs to a chat and contains the text or media reference, the sender, and a timestamp. And a Client represents a specific device — important because a single user might have a phone, tablet, and desktop all connected simultaneously.[/SAY]
+[DETAIL]- Users
+- Chats (2-100 users)
+- Messages
+- Clients (a user might have multiple devices)[/DETAIL]
+--- SECTION: API Design
+[SAY]Now for the API — and this is where WhatsApp differs from most systems. We're not using REST here. Chat apps have high-frequency bidirectional updates, so WebSockets are the right choice. Users open the app, establish a WebSocket connection over TLS, and all commands flow through that socket.
+
+The key commands are: createChat to start a new conversation, sendMessage to send a message on a chat, createAttachment for media uploads, and modifyChatParticipants to add or remove users from a group.
+
+The important pattern is acknowledgments. When a client receives a message, it sends an ack back to the server. This is how we confirm delivery actually happened — if we don't get an ack, we know we need to retry or store the message for later delivery.
+
+On the server-to-client side, we have parallel commands: chatUpdate when a chat is created or modified, and newMessage when a message arrives. Each expects a RECEIVED acknowledgment.[/SAY]
+[DETAIL]Next, we'll want to think through the API of our system. Unlike a lot of other products where a REST API is probably appropriate, for a chat app, we're going to have high-frequency updates being both sent and received. This is a perfect use case for a bi-directional socket connection !
+For this interview, we'll use WebSockets (over TLS for security), although a custom protocol over a raw TLS-encrypted TCP connection would also work. The idea will be that users will open the app and connect to the server, opening this socket which will be used to send and receive commands which represent our API.
+As we define our API, we'll specify the commands that are sent and received over the connection by the client.
+First, let's be able to create a chat.
+Now we should be able to send messages on the chat.
+We need a way to create attachments (note: I'm going to amend this later in the writeup).
+And we need a way to add/remove users to the chat.
+Each of these commands will have parallel commands that are sent to other clients. When the command has been received by clients, they'll send an `ack` command back to the server letting it know the command has been received (and it doesn't have to be sent again)!
+The message receipt acknowledgement is a bit non-obvious but crucial to making sure we don't lose messages. By forcing clients to ack, we can know for certain that the message has been delivered all the way to the client.
+When a chat is created or updated ...
+When a message is received ...
+Etc ...
+Note that enumerating all of these APIs can take time! In the actual interview, I might shortcut by only writing the command names and not the full API. It's also usually a good idea to summarize the API initially before you build out the high-level design in case things need to change. "I'll come back to this as I learn more" is completely acceptable!
+Our whiteboard might look like this:
+Commands Exchanged
+Now that we have a base to work with let's figure out how we can implement them while we satisfy our requirements.
+
+```
+// -> createChat
+{
+ "participants": [],
+ "name": ""
+} -> {
+ "chatId": ""
+}
+```
+
+```
+// -> sendMessage
+{
+ "chatId": "",
+ "message": "",
+ "attachments": []
+} -> {
+ "status": "SUCCESS" | "FAILURE",
+ "messageId": ""
+}
+```
+
+```
+// -> createAttachment
+{
+ "body": ...,
+ "hash":
+} -> {
+ "attachmentId": ""
+}
+```
+
+```
+// -> modifyChatParticipants
+{
+ "chatId": "",
+ "userId": "",
+ "operation": "ADD" | "REMOVE"
+} -> "SUCCESS" | "FAILURE"
+```
+
+```
+// <- chatUpdate
+{
+ "chatId": "",
+ "participants": [],
+} -> "RECEIVED"
+```
+
+```
+// <- newMessage
+{
+ "chatId": "",
+ "userId": ""
+ "message": "",
+ "attachments": []
+} -> "RECEIVED"
+```[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, I'd use DynamoDB for chat metadata and messages — we need fast key-value lookups by chatId and userId, and it scales horizontally. Message storage is temporary — once delivered and acknowledged, we can purge messages after 30 days.
+
+For tracking active WebSocket connections and which chat server a user is connected to, we'll keep that in Redis for fast lookups. The actual media files go to S3 with a separate HTTP upload path.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through the architecture one requirement at a time.
+
+For creating chats — the client sends a createChat command over the WebSocket. We use an L4 load balancer since we're using WebSockets and don't need L7 features like path-based routing. The Chat Server writes the chat metadata to DynamoDB.
+
+For sending and receiving messages — this is where the WebSocket connection really shines. The sender's Chat Server receives the message, writes it to the recipient's inbox in DynamoDB, and then attempts to deliver it in real-time through the recipient's WebSocket connection. If the recipient is online, great — deliver and get the ack. If not, the message sits in their inbox until they reconnect.
+
+For offline message delivery — when a user comes back online and reconnects, the Chat Server checks their inbox and delivers any pending messages.
+
+For media — attachments are uploaded via a separate HTTP service directly to S3. The message itself just contains a reference to the attachment ID. This keeps the heavy media traffic off the WebSocket path.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> LB[Load Balancer]
+    LB --> API[API Gateway]
+    API --> ASimple[A Simple Service]
+    API --> SeparateHttp[Separate Http Service]
+    API --> ForThis[For This Service]
+    API --> ToThe[To The Service]
+    API --> ToDifferent[To Different Service]
+    ASimple --> Cache[(Cache)]
+    ToDifferent --> DynamoDB[(DynamoDB)]
+    ToDifferent --> Database[(Database)]
+```
+
+**Data Flow:**
+1. 1) Users should be able to start group chats with multiple participants (limit 100)
+2. 2) Users should be able to send/receive messages.
+3. 3) Users should be able to receive messages sent while they are not online (up to 30 days).
+4. 4) Users should be able to send/receive media in their messages.[/DETAIL]
+--- SECTION: Deep Dive: Handle billions of simultaneous users?
+[SAY]So our single Chat Server isn't going to cut it at scale. With 2 billion users and maybe 200 million connected at any time — WhatsApp famously served 1-2 million users per host — we need hundreds of Chat Servers.
+
+The problem is: when User A sends a message to User B, User A might be on Chat Server 1 and User B on Chat Server 47. How does the message get routed?
+
+The solution I'd go with is Redis Pub/Sub. Each Chat Server subscribes to channels for the users it's serving. When a message needs to go to User B, we publish to User B's channel, and whichever Chat Server is holding their connection receives it.
+
+The key insight is why Pub/Sub over Kafka. Kafka persists messages to disk and maintains consumer offsets — that's heavy overhead per topic. With hundreds of millions of users, one topic per user would crush Kafka. Redis Pub/Sub channels are lightweight in-memory pointers to subscriber connections. They're "at most once" delivery, but that's fine — we've already written messages to the inbox for durability. Pub/Sub is just the fast path for real-time delivery.
+
+We'd shard across a cluster of Redis instances partitioned by user ID for scale.[/SAY]
+[DETAIL]**Problem:** How can we handle billions of simultaneous users?
+
+**Solution:** Great Solution: Offload to Pub/Sub
+ApproachThe last approach is to use a purpose-built system for the bouncing messages between servers.Redis Pub/Sub is a good example which uses a very lightweight hashmap of socket connections to allow you to ferry messages to arbitrary destinations. With Pub/Sub you can create a subscription for a given user ID and then publish messages to that subscription which are received "at most once" by the subscribers.The difference here with Kafka is that Pub/Sub is not managing storage of messages. Kafka requires significant disk-based overhead per topic (in addition to the messages themselves) since it persists messages to disk and maintains consumer offsets. Redis Pub/Sub channels are much lighter — they're essentially in-memory pointers to subscriber connections with no message persistence. That said, we wouldn't run all our pub/sub through a single Redis instance. In practice, we'd shard across a cluster of Redis instances (partitioning channels by user ID), with each instance handling a...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Naively horizontally scale
+- (Bad) Bad Solution: Keep a kafka topic per user
+- (Good) Good Solution: Consistent Hashing of Chat Servers
+- (Good) Scenario 1: Users have 250 chats each, but each chat has 1 other participant (1:1 chats).
+- (Good) Scenario 2: Users have 1 chat each, but each chat has 100 participants.[/DETAIL]
+--- SECTION: Deep Dive: What do we do to handle multiple clients for a given user?
+[SAY]So up to now we assumed one device per user, but in reality people have phones, tablets, laptops. If my phone got the latest message but my laptop was off, when I open it I need everything in sync.
+
+The solution is to track delivery at the client level, not the user level. Each client device has its own delivery state. When a message comes in, we try to deliver to all active clients for that user. Each client independently acks. If my laptop was offline, its state shows undelivered messages, and when it reconnects it pulls everything it missed from the inbox.
+
+This means our inbox table needs a per-client cursor or sequence number, not just per-user. A bit more bookkeeping, but it's the only way to handle multi-device correctly.[/SAY]
+[DETAIL]**Problem:** What do we do to handle multiple clients for a given user?[/DETAIL]
+--- SECTION: Deep Dive: What happens if the WebSocket connection fails?
+[SAY]Users are often on flaky networks. The WebSocket might technically be open but functionally dead — and TCP keepalives can take minutes to detect that. Way too slow for a chat app.
+
+The solution is application-level heartbeats. The Chat Server sends a ping every 10-30 seconds over the WebSocket. The client must respond with a pong within 5 seconds. If it doesn't, we close the connection.
+
+When the connection drops, the client reconnects and syncs any missed messages from the inbox. This gives us a guaranteed upper bound on detection time — with a 10-second heartbeat and 5-second timeout, we detect any dead connection within 15 seconds.
+
+Yes, heartbeats add overhead — at 200 million connected users with a 10-second interval, that's 20 million ping/pong pairs per second. But they're tiny messages, so in practice this is very manageable.[/SAY]
+[DETAIL]**Problem:** What happens if the WebSocket connection fails?
+
+**Solution:** Great Solution: Application-Level Heartbeats
+ApproachThe Chat Server sends periodic ping messages (every 10-30 seconds) over the WebSocket. The client must respond with a pong within a timeout (say, 5 seconds). If the client doesn't respond, the server closes the connection.When the connection closes, the client reconnects and syncs any missed messages from the Inbox. This catches dead connections within seconds rather than minutes.ChallengesHeartbeats add overhead—with 200M connected users and a 10-second heartbeat interval, that's 20M ping/pong exchanges per second. In practice this is fine (they're tiny messages), but it's worth noting.The heartbeats give you a guaranteed upper bound on detection time: if your heartbeat interval is 10s and timeout is 5s, you'll detect any dead connection within 15 seconds.
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Rely on TCP Timeouts
+- (Good) Good Solution: ACK Timeouts with Server-Side Retry[/DETAIL]
+--- SECTION: Deep Dive: What happens if Redis fails to deliver a message?
+[SAY]Right, so Redis Pub/Sub is "at most once" — if nobody is listening or Redis has a transient failure, the message is gone. But remember, we already write every message to the inbox before publishing to Pub/Sub. So all messages will eventually be delivered — the question is how quickly we detect that Pub/Sub dropped one.
+
+The approach I'd go with is piggybacking sequence numbers on heartbeats. We maintain a global incrementing sequence per user — every message to that user increments their sequence. When the server sends a heartbeat ping, it includes the user's current sequence number. If the client's local sequence is behind, it knows it missed messages and immediately triggers a sync from the inbox.
+
+This gives us fast detection — within one heartbeat interval — with essentially zero additional network overhead since we're already sending heartbeats. The trade-off is we need an atomic counter per user, which we can handle with Redis INCR.[/SAY]
+[DETAIL]**Problem:** What happens if Redis fails to deliver a message?
+
+**Solution:** Great Solution: Piggyback Sequence on Heartbeats
+ApproachCombine heartbeats (from the previous section) with sequence numbers:Global sequence per user: Maintain a single incrementing counter per user. Every message to that user increments their sequence.Include sequence in heartbeat: When the server sends a heartbeat ping, include the user's current sequence number.Client detects gaps: If the client's local sequence is behind the server's, it immediately requests a sync.This gives you fast detection of missed messages (within one heartbeat interval) with minimal additional load because you're already sending heartbeats.ChallengesThe global sequence per user requires an atomic counter, which adds coordination. You can use RedisINCRcommands, but it's another dependency. The benefit is that a single sequence catches all missed messages regardless of which chat they're in.
+
+**Alternatives considered:**
+- (Good) Good Solution: Periodic Polling
+- (Good) Good Solution: Sequence Numbers per Chat with Gap Detection[/DETAIL]
+--- SECTION: Deep Dive: Handle out-of-order messages?
+[SAY]Okay so honestly — we mostly don't, at least not on the server side. Out-of-order messages are a fact of life in distributed systems, and engineering strict ordering adds significant latency. We'd need delays to wait for late messages and a reordering mechanism.
+
+But for a chat app, users want messages fast, not perfectly ordered. So the approach is: each message carries a timestamp from the sending client, and the receiving client sorts messages by that timestamp for display. If a message arrives out of order, the client just inserts it in the right position in the conversation view.
+
+This means two users might briefly see messages in slightly different orders, but it converges quickly. The alternative — server-side ordering with delays — would make the app feel sluggish, which is a worse user experience than occasional ordering hiccups.[/SAY]
+[DETAIL]**Problem:** How do we handle out-of-order messages?[/DETAIL]
+--- SECTION: Deep Dive: Handle a "last seen" functionality?
+[SAY]So the interviewer wants "last seen" — when was this person last online? We want something efficient that doesn't hammer the database.
+
+The insight is we already know when users connect and disconnect. When a WebSocket connection drops — either the user closes the app or we detect it via heartbeat timeout — we record the disconnect timestamp in DynamoDB. We use conditional writes to make sure two Chat Servers don't race and overwrite a more recent timestamp.
+
+When a user wants to check someone's last seen status, there are two cases. If the target user is currently online — meaning they have an active WebSocket connection — we can check that directly via the Chat Server. If they're offline, we read the disconnect timestamp from DynamoDB.
+
+This is way more efficient than writing on every heartbeat, which at 200 million users would generate an absurd write load. We only write once when the user actually goes offline.[/SAY]
+[DETAIL]**Problem:** How can we handle a "last seen" functionality?
+
+**Solution:** Great Solution: Utilize Active Connections
+ApproachThere's two insights we can use this to our advantage.First, when users connect to our Chat Servers, they are creating a new Websocket connection. When they disconnect (or we close the connection due to missed heartbeats),we know about it.Second, if users are onlinethey can tell us.So what can we do? We'll create a new table in DynamoDB which will keep track of thelast disconnectfor a given user. Whenever a userdisconnectsfrom a Chat Server, we'll update this value using the current timestamp. We can use DynamoDB'sconditional expressions(e.g., only update if the new timestamp is greater than the existing one) to ensure that two servers don't race each other and accidentally overwrite a more recent disconnect time.Next, we'll have a special request we send from a client who wants to request a "last seen" a given user.// -> getLastSeen
+{
+ "targetUserId": "",
+ "requestingUserId": "",
+}We'll have a corresponding update message// -> updateLastSeen
+{
+ "targetUserId": "",
+ "reporter":...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Write to DB on every heartbeat[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For handling billions of users, we chose Redis Pub/Sub over Kafka — we traded message persistence for lightweight, in-memory routing that can handle hundreds of millions of channels. Durability is handled separately via the inbox. For dead connection detection, application-level heartbeats add overhead but give us a 15-second detection bound versus minutes with TCP keepalives. For missed message detection, piggybacking sequence numbers on heartbeats is elegant but adds a per-user atomic counter dependency on Redis. And for message ordering, we chose client-side sorting over server-side enforcement — faster delivery at the cost of occasional brief ordering inconsistencies.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Why |
+| --- | --- | --- | --- |
+| How can we handle billions of simultaneous users? | Great Solution: Offload to Pub/Sub | Scenario 2: Users have 1 chat each, but each chat has 100 participants. | Better scalability and reliability |
+| What happens if the WebSocket connection fails? | Great Solution: Application-Level Heartbeats | Good Solution: ACK Timeouts with Server-Side Retry | Better scalability and reliability |
+| What happens if Redis fails to deliver a message? | Great Solution: Piggyback Sequence on Heartbeats | Good Solution: Sequence Numbers per Chat with Gap Detection | Better scalability and reliability |[/DETAIL]
+[/SYSDESIGN]

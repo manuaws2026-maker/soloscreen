@@ -47,7 +47,7 @@ actor ScreenCaptureService {
 
     // MARK: - Window Exclusion
 
-    /// The window ID of SubtleAI's own overlay, so it can be excluded from captures.
+    /// The window ID of SoloScreen's own overlay, so it can be excluded from captures.
     /// Set this from the main actor after the stealth window is created.
     private var excludedWindowIDs: Set<UInt32> = []
 
@@ -79,7 +79,7 @@ actor ScreenCaptureService {
             throw CaptureError.noDisplaysFound
         }
 
-        // Build a filter that excludes SubtleAI's own windows.
+        // Build a filter that excludes SoloScreen's own windows.
         let excludedWindows = content.windows.filter { window in
             excludedWindowIDs.contains(UInt32(window.windowID))
         }

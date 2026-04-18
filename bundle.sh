@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# bundle.sh — Build SubtleAI, create a macOS .app bundle, and ad-hoc sign it.
+# bundle.sh — Build SoloScreen, create a macOS .app bundle, and ad-hoc sign it.
 #
 # Usage:
 #   ./bundle.sh           Build release and bundle
@@ -10,12 +10,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR"
-APP_NAME="SubtleAI"
+APP_NAME="SoloScreen"
 BUNDLE_DIR="$PROJECT_DIR/build/${APP_NAME}.app"
 CONTENTS_DIR="$BUNDLE_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
-BINARY_NAME="SubtleAI"
+BINARY_NAME="SoloScreen"
 
 # ─── Clean mode ───────────────────────────────────────────────────────
 if [[ "${1:-}" == "clean" ]]; then

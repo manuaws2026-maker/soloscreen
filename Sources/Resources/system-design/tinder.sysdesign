@@ -1,0 +1,182 @@
+[SYSDESIGN]
+--- SECTION: Requirements
+[SAY]Alright, so for Tinder let me start with the functional requirements.
+
+First, users need to be able to create a profile with their photos, bio, and match preferences like age range and distance. Second, we need a recommendation engine that serves up a stack of potential matches. Third, users swipe yes or no on profiles, and if both swipe yes, they get a match notification. And fourth, the system should never re-show a profile you've already swiped on.
+
+For non-functional requirements — swiping needs strong consistency so we don't miss mutual matches. We're looking at around 20 million daily active users doing roughly 100 swipes each, so that's 2 billion swipes per day. And loading the recommendation stack should feel instant, under 300ms.
+
+Below the line for now: fake profile detection, messaging after matching, and monitoring and alerting.[/SAY]
+[DETAIL]**Functional Requirements (Core):**
+1. Users can create a profile with photos, bio, and match preferences (age range, distance, gender)
+2. Users are served a stack of recommended potential matches based on preferences and location
+3. Users swipe yes/no on profiles — mutual yes triggers a match notification
+4. System never re-shows a profile the user has already swiped on
+
+**Non-Functional Requirements:**
+- Strong consistency on swipes: no missed matches when two users swipe yes simultaneously
+- Scale: 20M DAU, ~100 swipes/user/day → ~2B swipes/day
+- Low-latency feed: recommendation stack loads in < 300ms
+- High availability: 99.9% uptime
+
+**Below the Line (Out of Scope):**
+- Fake profile detection
+- In-app messaging post-match
+- Monitoring / alerting
+- Content moderation[/DETAIL]
+--- SECTION: Core Entities
+[SAY]Let me define the core entities. We've got three main ones.
+
+A User represents both someone using the app and a profile that could appear in someone else's stack — their photos, bio, preferences, and location. I'm including User explicitly here because users are swiping on other users, so it's central to the design.
+
+A Swipe is the expression of yes or no on a profile. It belongs to the swiping user and references the target user. We need both user IDs plus the direction.
+
+And a Match is the result of two users both swiping yes on each other — it links the two user IDs together and unlocks whatever post-match features we build later.[/SAY]
+[DETAIL]- **User** : This represents both a user using the app and a profile that might be shown to the user. We typically omit the "user" concept when listing entities, but because users are swiping on other users, we'll include it here.
+- **Swipe** : Expression of "yes" or "no" on a user profile; belongs to a user ( `swiping_user` ) and is about another user ( `target_user` ).
+- **Match** : A connection between 2 users as a result of them both swiping "yes" on each other.[/DETAIL]
+--- SECTION: API Design
+[SAY]Okay so for the API, three key endpoints.
+
+First, POST to /profile for creating or updating a user's match preferences — age range, distance, gender interest. I'm keeping this focused on preferences since that's what drives the recommendation engine.
+
+Second, GET /feed with lat, long, and distance params. This returns an array of user profiles to swipe on. Now, you might think about pagination here, but it's actually not needed — since we're generating recommendations, the client just hits the endpoint again when it runs out of profiles rather than paging through a fixed set.
+
+Third, POST /swipe/:userId with a decision of yes or no. This records the swipe and, if it's a mutual yes, returns match info.
+
+For all of these, the authenticated user's identity comes from the session token or JWT in the header — never from the request body. Security basics.[/SAY]
+[DETAIL]The API is the primary interface that users will interact with. You'll want to define the API early on, as it will guide your high-level design. We just need to define an endpoint for each of our functional requirements.
+The first endpoint we need is an endpoint to create a profile for a user. Of course, this would include images, bio, etc, but we're going to focus just on their match preferences for this question.
+Next we need an endpoint to get the "feed" of user profiles to swipe on, this way we have a "stack" of profiles ready for the user:
+You might be tempted to proactively consider pagination for the feed endpoint. This is actually superfluous for Tinder b/c we're really generating recommendations. Rather than "paging", the app can just hit the endpoint again for more recommendations if the current list is exhausted.
+We'll also need an endpoint to power swiping:
+With each of these requests, the user information will be passed in the headers (either via session token or JWT). This is a common pattern for APIs and is a good way to ensure that the user is authenticated and authorized to perform the action while preserving security. You should avoid passing user information in the request body, as this can be easily manipulated by the client.In the interview, you may want to just denote which endpoints require user authentication and which don't. In our case, all endpoints will require authentication.
+
+```
+POST /profile
+{
+ "age_min": 20,
+ "age_max": 30,
+ "distance": 10,
+ "interestedIn": "female" | "male" | "both",
+ ...
+}
+```
+
+```
+GET /feed?lat={}&long={}&distance={} -> User[]
+```
+
+```
+POST /swipe/{userId}
+Request:
+{
+ decision: "yes" | "no"
+}
+```[/DETAIL]
+--- SECTION: Data Model
+[SAY]For the data model, I'd use PostgreSQL for our core transactional data — users, swipes, and matches — because we need strong consistency, especially around the swipe-and-match flow where race conditions could cause us to miss a mutual match.
+
+We'll layer in specialized stores on top of that. Redis for the atomic swipe operations I'll get into during deep dives, and potentially Elasticsearch or a geospatial index for the recommendation queries.[/SAY]
+[DETAIL]Core tables derived from entities above.
+PostgreSQL for transactional data with strong consistency.
+Consider specialized stores (Redis, DynamoDB) for high-throughput access patterns.[/DETAIL]
+--- SECTION: High-Level Architecture
+[SAY]Let me walk through the architecture one requirement at a time.
+
+For profile creation, the client hits our API Gateway through a load balancer, routes to a Profile Service that persists preferences in Postgres. Straightforward.
+
+For the recommendation feed, the client requests GET /feed, which goes to a Recommendation Service. This service queries an indexed store to find nearby users matching preferences, filters out previously swiped profiles, and returns a stack. I'll dig into how we make this fast in the deep dives.
+
+For swiping, the POST /swipe request goes to a Swipe Service. This is where it gets interesting — we need to record the swipe and atomically check if the other person already swiped yes. If it's mutual, we create a Match record and notify both users through a Push Notification Service.
+
+For match notifications, Person B gets the match instantly since they triggered the check. Person A needs a push notification since they swiped earlier and aren't actively waiting.[/SAY]
+[DETAIL]```mermaid
+graph LR
+    Client([Client]) --> LB[Load Balancer]
+    LB --> API[API Gateway]
+    API --> ProfileSvc[Profile Service]
+    API --> RecSvc[Recommendation Service]
+    API --> SwipeSvc[Swipe Service]
+    ProfileSvc --> ProfileDB[(Postgres — profiles)]
+    RecSvc --> Geo[(Redis GEO — location index)]
+    RecSvc --> ProfileDB
+    SwipeSvc --> SwipeCache[(Redis — swipe state)]
+    SwipeSvc --> SwipeDB[(Postgres — swipes + matches)]
+    SwipeSvc --> Push[Push Notification Service]
+```
+
+**Data Flows:**
+
+**Create profile (Req #1):** Client → API Gateway → Profile Service → Postgres (profile + preferences).
+
+**View potential matches (Req #2):** Client → API Gateway → Recommendation Service → Redis GEO (nearby candidates within max distance) → filter by preferences + exclude already-swiped → hydrate from Postgres → return stack.
+
+**Swipe (Reqs #3 + #4):** Client → API Gateway → Swipe Service → (a) record swipe in Postgres + cache in Redis → (b) atomically check the other user's swipe for a mutual-yes → (c) on match, INSERT match row + notify Push Service which delivers to the earlier swiper. Current user sees the match immediately in the response.[/DETAIL]
+--- SECTION: Deep Dive: Ensure that swiping is consistent and low latency?
+[SAY]So here's the core consistency problem. Imagine Person A and Person B both swipe yes on each other at almost the exact same time. Without proper handling, both swipe requests could check for the inverse swipe, find nothing, and neither gets a match. That's a missed connection — really bad for a dating app.
+
+The solution is to use Redis for atomic swipe operations. The key insight is that we create a deterministic key by sorting both user IDs — so whether A swipes on B or B swipes on A, the swipes land on the same Redis key. Something like "swipes:123:456" where 123 and 456 are the sorted user IDs.
+
+We use a Redis hash at that key to store both swipe directions. When a swipe comes in, we atomically set the swipe value and check if the other direction already exists as a yes. Since Redis operations on a single key are atomic, there's no race condition.
+
+We still write to Cassandra as our durable storage layer for the full swipe history, but Redis handles the real-time match detection. It gives us the atomicity we need at the speed we need it — sub-millisecond for the match check.[/SAY]
+[DETAIL]**Problem:** How can we ensure that swiping is consistent and low latency?
+
+**Solution:** Great Solution: Redis for Atomic Operations
+ApproachRedis is a better fit for handling the consistency requirements of our swipe matching logic. While Cassandra excels at durability and storing large amounts of data, it's not designed for the kind ofatomicoperations we need for real-time match detection. Instead, we can use Redis to handle the atomic swipe operations while still using Cassandra as our durable storage layer.The key insight remains the same as before - we need swipes between the same users to land on the same shard. We can achieve this by creating keys that combine both user IDs in a consistent way.The key:value structure we'll use is as follows:Key: "swipes:123:456"
+Value: {
+ "123_swipe": "right", // or yes/no
+ "456_swipe": "left" // or yes/no
+}def get_key(user_a, user_b):
+ # Sort IDs so (A->B) and (B->A) map to same key
+ sorted_ids = sorted([user_a, user_b])
+ return f"swipes:{sorted_ids[0]}:{sorted_ids[1]}"
+
+def handle_swipe(from_user, to_user, direction):
+ key = get_key(from_user, to_user)
+
+ # Use Redis hash t...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: Database Polling for Matches
+- (Good) Good Solution: Transactions[/DETAIL]
+--- SECTION: Deep Dive: Ensure low latency for feed/stack generation?
+[SAY]Right, so when a user opens the app, they want to start swiping immediately. Our current design runs a query every time someone needs a new stack, which is way too slow at scale.
+
+I'd go with a hybrid approach — pre-computation plus an indexed database. Here's how it works. We periodically pre-compute and cache a feed for each user based on their preferences and location. When someone opens the app, they get this cached feed instantly. No query latency at all.
+
+Now as they swipe through and exhaust the cached feed, we seamlessly transition to generating matches in real-time using Elasticsearch. Elasticsearch gives us fast geospatial and multi-field queries so we can find nearby users matching their preferences quickly.
+
+The nice thing is we can also trigger a background refresh when the user is down to their last few profiles. So from their perspective, they never run out of people to swipe on and they never wait. The pre-computed feed handles the common case, and the real-time fallback handles active users who swipe a lot.[/SAY]
+[DETAIL]**Problem:** How can we ensure low latency for feed/stack generation?
+
+**Solution:** Great Solution: Combination of Pre-computation and Indexed Database
+ApproachThe good news is we can have the best of both worlds by combining the benefits of both pre-computation and real-time querying using an indexed database.We periodically pre-compute and cache feeds for users based on their preferences and locations. When a user opens the app, they receive this cached feed instantly, allowing for immediate interaction without any delay.As users swipe through and potentially exhaust their cached feed, the system seamlessly transitions to generating additional matches in real-time. This is achieved by leveraging Elasticsearch of the indexed database we discussed above.By combining the two methods, we maintain low latency throughout the user's session. The initial cached feed provides instant access, while the indexed database ensures that even the most active users receive fresh and relevant matches without noticeable delays.We can also trigger the refresh of the stack when a user has a few profiles left to swipe through. This way, as far as the use...
+
+**Alternatives considered:**
+- (Good) Good Solution: Use of Indexed Databases for Real-Time Querying
+- (Good) Good Solution: Pre-computation and Caching[/DETAIL]
+--- SECTION: Deep Dive: Avoid showing user profiles that the user has previously ...
+[SAY]Okay so this is about making sure we never re-show someone a profile they already swiped on. That'd be a terrible experience — either they think their yes wasn't recorded, or they're annoyed seeing someone they already said no to.
+
+For most users, a simple cache of their swipe history works fine. We keep a set of swiped user IDs in Redis and do a contains check when building the feed. Fast and simple.
+
+But for power users who've swiped on tens of thousands of profiles, that set gets big and the contains check during feed generation slows down. That's where I'd add a bloom filter. If a user's swipe history exceeds a certain size, we build a bloom filter and cache it.
+
+The key property of bloom filters is they never produce false negatives — if the bloom filter says "not swiped," we're certain they haven't swiped on that profile. It can produce false positives, meaning we might occasionally skip a profile the user hasn't actually seen, but that's an acceptable trade-off. We'd rather accidentally hide a few profiles than show someone a duplicate.[/SAY]
+[DETAIL]**Problem:** How can the system avoid showing user profiles that the user has previously swiped on?
+
+**Solution:** Great Solution: Cache + Contains Check + Bloom Filter
+Approachthis approach skews somewhat "over-engineered", but is a legit usecase for a bloom filter to support feed building for users with large swipe histories.We might consider building on top of our previous approach even more. For users with large swipe histories, we might consider storing abloom filter. If a user exceeds a swipe history of a certain size (a size that would make storage in a cache unwieldy or "contains" checks slow during a query), we can build and cache a bloom filter for that user and use it in the filtering process.A bloom filter would sometimes yield false positives for swipes, meaning we'd sometimes assume a user swiped on a profile that they didn't swipe on. However, the bloom filter wouldnevergenerate false negatives, meaning we'd never say a user hadn't swiped on a profile they actuallydidswipe on. This means we'd successfully avoid re-showing profiles, but there might be a small number of profiles that we might never show the user, due to false positives. B...
+
+**Alternatives considered:**
+- (Bad) Bad Solution: DB Query + Contains Check[/DETAIL]
+--- SECTION: Trade-offs
+[SAY]Let me walk through the key trade-offs. For swipe consistency, we chose Redis atomic operations over database transactions — we traded some infrastructure complexity for the atomicity and speed we need at 2 billion swipes per day. For feed generation, we went with the hybrid pre-computation plus Elasticsearch approach over pure pre-computation — more moving parts, but it handles both casual and power users without latency spikes. And for duplicate prevention, the bloom filter adds complexity but it's the only way to keep feed generation fast for users with massive swipe histories, at the cost of occasionally hiding an unseen profile.[/SAY]
+[DETAIL]| Decision | Chosen | Alternative | Trade-off |
+| --- | --- | --- | --- |
+| Swipe consistency | Redis for Atomic Operations | Database Transactions | Speed + atomicity at scale, but depends on Redis availability |
+| Feed/stack generation | Pre-computation + Indexed Database | Pure pre-computation or pure real-time | More moving parts, but handles both casual and power users |
+| Duplicate prevention | Cache + Bloom Filter | DB Query + Contains Check | Possible false positives (hidden profiles), but fast at any swipe history size |[/DETAIL]
+[/SYSDESIGN]

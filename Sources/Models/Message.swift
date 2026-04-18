@@ -28,13 +28,15 @@ struct Message: Identifiable, Codable, Equatable {
         var data: Data
         var fileName: String?
         var mimeType: String
+        var textContent: String?
 
-        init(id: UUID = UUID(), type: AttachmentType, data: Data, fileName: String? = nil, mimeType: String = "image/png") {
+        init(id: UUID = UUID(), type: AttachmentType, data: Data, fileName: String? = nil, mimeType: String = "image/png", textContent: String? = nil) {
             self.id = id
             self.type = type
             self.data = data
             self.fileName = fileName
             self.mimeType = mimeType
+            self.textContent = textContent
         }
     }
 
