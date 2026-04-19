@@ -2,6 +2,7 @@ import SwiftUI
 
 struct MainView: View {
     @EnvironmentObject var appState: AppState
+    @ObservedObject private var subscriptionManager = SubscriptionManager.shared
 
     // MARK: - Theme Constants
     private let bgColor = Color(hex: "0D1117")
@@ -178,6 +179,13 @@ struct MainView: View {
                             .zIndex(160)
                     }
 
+                    // Paywall — shown after 3 free prompts.
+                    if subscriptionManager.showPaywall {
+                        PaywallView()
+                            .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                            .zIndex(200)
+                    }
+
                     // (Diagram expansion now opens in a dedicated NSWindow
                     // managed by AppDelegate — see showDiagramWindow — so the
                     // whole stealth / sharingType treatment applies and it
@@ -204,12 +212,8 @@ struct MainView: View {
                 .environmentObject(appState)
                 .frame(minWidth: 520, minHeight: 440)
         }
-        .sheet(isPresented: $appState.showOnboarding) {
-            OnboardingView()
-                .environmentObject(appState)
-                .frame(width: 520, height: 560)
-                .interactiveDismissDisabled()
-        }
+        // Onboarding is managed as a centered NSWindow by AppDelegate
+        // (not a sheet, which would anchor to the right-edge panel).
     }
 
     // MARK: - Detail Content

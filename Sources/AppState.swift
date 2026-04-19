@@ -365,6 +365,12 @@ final class AppState: ObservableObject {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedText.isEmpty || !attachments.isEmpty else { return }
 
+        // Subscription gate — show paywall if free prompts exhausted.
+        if SubscriptionManager.shared.needsSubscription {
+            SubscriptionManager.shared.showPaywall = true
+            return
+        }
+
         let userMessage = Message(
             role: .user,
             content: trimmedText,
@@ -473,6 +479,9 @@ final class AppState: ObservableObject {
 
                 self.saveSessions()
 
+                // Track free prompt usage for subscription paywall.
+                SubscriptionManager.shared.recordPrompt()
+
             } catch is CancellationError {
                 // Cancelled by user.
             } catch LLMError.cancelled {
@@ -559,6 +568,9 @@ final class AppState: ObservableObject {
 
                 Task { @MainActor in
                     do {
+                        // Refresh cached key statuses so we pick up keys
+                        // the user configured after launch.
+                        await refreshKeyStatuses()
                         guard let provider = effectiveTranscriptionProvider else {
                             setError("No transcription provider configured. Add a Deepgram or OpenAI key in Settings.", settingsTab: "Transcription")
                             return

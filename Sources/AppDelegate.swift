@@ -20,8 +20,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     private var settingsCancellable: AnyCancellable?
     private var showSettingsCancellable: AnyCancellable?
     private var showDiagramCancellable: AnyCancellable?
+    private var showOnboardingCancellable: AnyCancellable?
     private var settingsWindow: NSWindow?
     private var diagramWindow: NSWindow?
+    private var onboardingWindow: NSWindow?
     private var minimizeObserver: Any?
 
     // MARK: - Application Lifecycle
@@ -87,6 +89,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 }
             }
 
+        // Open / close the centered Onboarding window.
+        showOnboardingCancellable = state.$showOnboarding
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] shouldShow in
+                if shouldShow {
+                    self?.showOnboardingWindow(appState: state)
+                } else {
+                    self?.closeOnboardingWindow()
+                }
+            }
+
         // Listen for minimize requests from SwiftUI views.
         // Every time any window (main panel, settings, sheets, popovers that
         // back onto NSWindow) becomes key, enforce the current stealth +
@@ -125,6 +138,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             }
         }
 
+        // Hide main panel for onboarding (when user clicks API key link).
+        NotificationCenter.default.addObserver(
+            forName: .soloScreenHideForOnboarding,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.stealthWindowManager?.minimize()
+            }
+        }
+
+        // Restore onboarding when the dot is clicked (main panel restored).
+        NotificationCenter.default.addObserver(
+            forName: .soloScreenDidRestore,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self,
+                      self.appState?.showOnboarding == true,
+                      let w = self.onboardingWindow else { return }
+                w.level = .floating
+                w.orderFrontRegardless()
+                w.makeKeyAndOrderFront(nil)
+            }
+        }
+
         // Prompt for permissions the app relies on (Screen Recording for
         // Live Listen). Done after the UI is up so the system dialog isn't
         // the first thing the user sees.
@@ -152,6 +192,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 "Live Listen needs the Screen Recording permission to hear system audio. Enable SoloScreen in System Settings → Privacy & Security → Screen Recording.",
                 systemSettingsURL: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
             )
+        }
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        // Restore the onboarding window + main panel if they were
+        // hidden (user went to browser to copy an API key).
+        if appState?.showOnboarding == true, let w = onboardingWindow, !w.isVisible {
+            // Restore main panel first (from dot)
+            stealthWindowManager?.restore()
+            // Then bring onboarding back on top
+            w.level = .floating
+            w.orderFrontRegardless()
+            w.makeKeyAndOrderFront(nil)
         }
     }
 
@@ -460,32 +513,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 )
             )
             w.contentViewController = host
-            // Resize to fit the new diagram.
-            let screen = w.screen ?? NSScreen.main ?? NSScreen.screens.first
-            let sf = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-            let chrome: CGFloat = 92
-            let winW = max(500, min(image.size.width * 2 + 48, sf.width * 0.9))
-            let winH = max(400, min(image.size.height * 2 + chrome + 48, sf.height * 0.9))
-            w.setContentSize(NSSize(width: winW, height: winH))
-            w.center()
+            // Keep existing window size — just update content.
             NSApp.activate(ignoringOtherApps: true)
             w.orderFrontRegardless()
             w.makeKeyAndOrderFront(nil)
             return
         }
 
-        // Size the window to fit the diagram at ~2× inline size, capped
-        // to 90% of the screen so it never overflows.
+        // Size the window to 70% of screen, capped to reasonable bounds.
         let screen = NSScreen.main ?? NSScreen.screens.first
         let screenFrame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let maxW = screenFrame.width * 0.9
-        let maxH = screenFrame.height * 0.9
-        // Target 2× the image's natural size + chrome (toolbar ~44pt + padding)
-        let chrome: CGFloat = 92
-        let imgW = min(image.size.width * 2 + 48, maxW)
-        let imgH = min(image.size.height * 2 + chrome + 48, maxH)
-        let winW = max(500, imgW)
-        let winH = max(400, imgH)
+        let winW = min(screenFrame.width * 0.7, 900)
+        let winH = min(screenFrame.height * 0.7, 700)
 
         let contentRect = NSRect(x: 0, y: 0, width: winW, height: winH)
         let window = NSWindow(
@@ -531,9 +570,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         diagramWindow?.close()
     }
 
+    // MARK: - Onboarding Window
+
+    private func showOnboardingWindow(appState: AppState) {
+        if let w = onboardingWindow {
+            w.level = .floating
+            NSApp.activate(ignoringOtherApps: true)
+            w.orderFrontRegardless()
+            w.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        let winW: CGFloat = 560
+        let winH: CGFloat = 640
+        let contentRect = NSRect(x: 0, y: 0, width: winW, height: winH)
+        let window = NSWindow(
+            contentRect: contentRect,
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "SoloScreen"
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.backgroundColor = NSColor(red: 0x0D/255.0, green: 0x11/255.0, blue: 0x17/255.0, alpha: 1.0)
+        window.isMovableByWindowBackground = true
+        window.isReleasedWhenClosed = false
+        // No .transient — onboarding must survive app deactivation
+        // when user switches to browser to copy API keys. Float above
+        // other windows so it stays visible alongside the browser.
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.isExcludedFromWindowsMenu = true
+        window.hidesOnDeactivate = false
+        window.level = .floating
+        // Fixed size — no resizing.
+        window.minSize = NSSize(width: winW, height: winH)
+        window.maxSize = NSSize(width: winW, height: winH)
+        let s = appState.settings
+        window.sharingType = s.stealthEnabled ? .none : .readOnly
+        window.delegate = self
+        window.center()
+
+        let host = NSHostingController(
+            rootView: OnboardingView().environmentObject(appState)
+        )
+        // Pin the hosting view's size so SwiftUI doesn't expand to fill the screen.
+        host.sizingOptions = []
+        host.preferredContentSize = NSSize(width: winW, height: winH)
+        window.contentViewController = host
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        self.onboardingWindow = window
+    }
+
+    private func closeOnboardingWindow() {
+        onboardingWindow?.close()
+    }
+
     // MARK: - NSWindowDelegate
 
-    /// When the user hits the red close button, keep our app state in sync.
     func windowWillClose(_ notification: Notification) {
         guard let win = notification.object as? NSWindow else { return }
 
@@ -546,6 +643,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             diagramWindow = nil
             if appState?.showExpandedDiagram == true {
                 appState?.showExpandedDiagram = false
+            }
+        } else if win === onboardingWindow {
+            onboardingWindow = nil
+            if appState?.showOnboarding == true {
+                appState?.showOnboarding = false
             }
         }
     }

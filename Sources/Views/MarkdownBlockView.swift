@@ -362,12 +362,7 @@ struct ZoomableDiagramOverlay: View {
     private let step: CGFloat = 0.25
 
     var body: some View {
-        ZStack {
-            Color.black.opacity(0.6)
-                .ignoresSafeArea()
-                .onTapGesture { onClose() }
-
-            VStack(spacing: 0) {
+        VStack(spacing: 0) {
                 HStack(spacing: 10) {
                     Image(systemName: "point.3.connected.trianglepath.dotted")
                         .foregroundStyle(Color(hex: "22C55E"))
@@ -422,26 +417,32 @@ struct ZoomableDiagramOverlay: View {
 
                 Divider().overlay(Color(hex: "30363D"))
 
-                ScrollView([.horizontal, .vertical]) {
-                    Image(nsImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(width: image.size.width * zoom, height: image.size.height * zoom)
-                        .padding(24)
-                        .animation(.easeOut(duration: 0.15), value: zoom)
+                // At zoom=1 the image fits the window. Zoom scales from there.
+                GeometryReader { geo in
+                    ScrollView([.horizontal, .vertical]) {
+                        let fitW = geo.size.width - 32
+                        let fitH = geo.size.height - 32
+                        let aspect = image.size.width / max(image.size.height, 1)
+                        let baseW = min(fitW, fitH * aspect)
+                        let baseH = baseW / max(aspect, 0.01)
+
+                        Image(nsImage: image)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: baseW * zoom, height: baseH * zoom)
+                            .frame(
+                                minWidth: geo.size.width - 32,
+                                minHeight: geo.size.height - 32,
+                                alignment: .center
+                            )
+                            .padding(16)
+                            .animation(.easeOut(duration: 0.15), value: zoom)
+                    }
                 }
                 .background(Color(hex: "0D1117"))
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding(24)
-            .background(
-                RoundedRectangle(cornerRadius: 12)
-                    .fill(Color(hex: "0D1117"))
-                    .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color(hex: "30363D"), lineWidth: 1))
-                    .padding(24)
-            )
-            .shadow(color: .black.opacity(0.35), radius: 14, y: 4)
-        }
+            .background(Color(hex: "0D1117"))
     }
 }
 

@@ -198,6 +198,7 @@ final class StealthWindowManager {
             } else {
                 panel.orderFrontRegardless()
             }
+            NotificationCenter.default.post(name: .soloScreenDidRestore, object: nil)
         }
         isVisible.toggle()
     }
@@ -206,9 +207,10 @@ final class StealthWindowManager {
     func show() {
         guard !isVisible else { return }
         if isMinimized {
-            restore()
+            restore()  // restore() already posts .soloScreenDidRestore
         } else {
             panel?.orderFrontRegardless()
+            NotificationCenter.default.post(name: .soloScreenDidRestore, object: nil)
         }
         isVisible = true
     }
@@ -332,6 +334,10 @@ final class StealthWindowManager {
                     panel.animator().alphaValue = 1.0
                 }
                 self.panelFrameBeforeMinimize = nil
+
+                // Let AppDelegate know so it can restore the onboarding
+                // window (or any other auxiliary windows) too.
+                NotificationCenter.default.post(name: .soloScreenDidRestore, object: nil)
             }
         })
     }

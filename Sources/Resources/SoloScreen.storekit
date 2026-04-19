@@ -1,0 +1,57 @@
+{
+  "identifier" : "com.soloscreen.storekit",
+  "nonRenewingSubscriptions" : [
+
+  ],
+  "products" : [
+
+  ],
+  "settings" : {
+    "_applicationInternalID" : "soloscreen",
+    "_developerTeamID" : "",
+    "_lastSynchronizedDate" : 745329600
+  },
+  "subscriptionGroups" : [
+    {
+      "id" : "soloscreen_pro",
+      "localizations" : [
+
+      ],
+      "name" : "SoloScreen Pro",
+      "subscriptions" : [
+        {
+          "adHocOffers" : [
+
+          ],
+          "codeOffers" : [
+
+          ],
+          "displayPrice" : "9.99",
+          "familyShareable" : false,
+          "groupNumber" : 1,
+          "internalID" : "com.soloscreen.pro.monthly",
+          "introductoryOffer" : null,
+          "localizations" : [
+            {
+              "description" : "Unlimited AI prompts, stealth mode, multi-provider support",
+              "displayName" : "SoloScreen Pro Monthly",
+              "locale" : "en_US"
+            }
+          ],
+          "productID" : "com.soloscreen.pro.monthly",
+          "recurringSubscriptionPeriod" : "P1M",
+          "referenceName" : "Pro Monthly",
+          "subscriptionGroupID" : "soloscreen_pro",
+          "type" : "RecurringSubscription",
+          "winbackOffers" : [
+
+          ]
+        }
+      ]
+    }
+  ],
+  "version" : {
+    "major" : 4,
+    "minor" : 0
+  }
+}

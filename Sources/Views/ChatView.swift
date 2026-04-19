@@ -711,6 +711,8 @@ extension Notification.Name {
     static let soloScreenInsertDictation = Notification.Name("soloScreenInsertDictation")
     static let soloScreenRequestLiveHelp = Notification.Name("soloScreenRequestLiveHelp")
     static let soloScreenCloseLiveHelp = Notification.Name("soloScreenCloseLiveHelp")
+    static let soloScreenHideForOnboarding = Notification.Name("soloScreenHideForOnboarding")
+    static let soloScreenDidRestore = Notification.Name("soloScreenDidRestore")
 }
 
 // MARK: - Live Listen Controls (top-bar)
