@@ -24,6 +24,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     private var settingsWindow: NSWindow?
     private var diagramWindow: NSWindow?
     private var onboardingWindow: NSWindow?
+    private var codeViewerWindow: NSWindow?
+    private var codeViewerDotPanel: KeyablePanel?
+    private var codeViewerFrameBeforeMinimize: NSRect?
+    private var codeViewerState = CodeViewerState()
+    private var showCodeViewerCancellable: AnyCancellable?
     private var minimizeObserver: Any?
 
     // MARK: - Application Lifecycle
@@ -86,6 +91,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                     self?.showDiagramWindow(appState: state)
                 } else {
                     self?.closeDiagramWindow()
+                }
+            }
+
+        // Open / close the floating Code Viewer window.
+        showCodeViewerCancellable = state.$showCodeViewer
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] shouldShow in
+                if shouldShow {
+                    self?.showCodeViewerWindow(appState: state)
+                } else {
+                    self?.closeCodeViewerWindow()
                 }
             }
 
@@ -570,6 +586,194 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         diagramWindow?.close()
     }
 
+    // MARK: - Code Viewer Window
+
+    /// Open a floating Code Viewer window. A regular titled NSWindow that
+    /// follows the same stealth + opacity rules as Settings/Diagram so it's
+    /// hidden from screen capture when stealth is on. Floating level so it
+    /// stays above the user's other windows like the main panel does.
+    private func showCodeViewerWindow(appState: AppState) {
+        // If we minimized to a dot, restore from there instead of creating a
+        // brand-new window.
+        if codeViewerDotPanel?.isVisible == true {
+            restoreCodeViewerFromDot()
+            return
+        }
+
+        if let w = codeViewerWindow {
+            NSApp.activate(ignoringOtherApps: true)
+            w.orderFrontRegardless()
+            w.makeKeyAndOrderFront(nil)
+            // Prompt for a folder if none has been opened yet.
+            if codeViewerState.rootFolder == nil {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                    self?.codeViewerState.presentFolderPicker()
+                }
+            }
+            return
+        }
+
+        let screen = NSScreen.main ?? NSScreen.screens.first
+        let screenFrame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let winW = min(screenFrame.width * 0.7, 1100)
+        let winH = min(screenFrame.height * 0.8, 720)
+
+        let contentRect = NSRect(x: 0, y: 0, width: winW, height: winH)
+        // Borderless KeyablePanel — no native macOS title bar, so we don't get
+        // a duplicate title bar on top of CodeViewerView's own chrome. Same
+        // pattern the main stealth panel uses.
+        let window = KeyablePanel(
+            contentRect: contentRect,
+            styleMask: [.borderless, .nonactivatingPanel, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.backgroundColor = NSColor(red: 0x1E/255.0, green: 0x1E/255.0, blue: 0x1E/255.0, alpha: 1.0)
+        window.isOpaque = true
+        window.hasShadow = true
+        // Drag from any non-button area in the custom title bar.
+        window.isMovableByWindowBackground = true
+        window.isReleasedWhenClosed = false
+        window.level = .floating
+        window.isFloatingPanel = true
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        window.hidesOnDeactivate = false
+        let s = appState.settings
+        window.sharingType = s.stealthEnabled ? .none : .readOnly
+        window.minSize = NSSize(width: 600, height: 360)
+        window.delegate = self
+        window.center()
+
+        // Use NSHostingView (not NSHostingController) so the SwiftUI view fills
+        // the window via autoresizing instead of intrinsic-content sizing —
+        // CodeViewerView is fully flexible in both axes.
+        let hostingView = NSHostingView(
+            rootView: CodeViewerView(
+                state: codeViewerState,
+                onClose: { [weak self] in
+                    self?.appState?.showCodeViewer = false
+                },
+                onMinimize: { [weak self] in
+                    self?.minimizeCodeViewerToDot()
+                },
+                onOpacityChange: { [weak self] alpha in
+                    self?.codeViewerWindow?.alphaValue = CGFloat(alpha)
+                }
+            )
+        )
+        hostingView.frame = window.contentView?.bounds ?? contentRect
+        hostingView.autoresizingMask = [.width, .height]
+        window.contentView = hostingView
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        self.codeViewerWindow = window
+
+        // First time: prompt the user to pick a folder so they don't stare
+        // at an empty sidebar wondering what to do.
+        if codeViewerState.rootFolder == nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.codeViewerState.presentFolderPicker()
+            }
+        }
+    }
+
+    private func closeCodeViewerWindow() {
+        codeViewerDotPanel?.orderOut(nil)
+        codeViewerWindow?.close()
+    }
+
+    // MARK: - Code Viewer Dot
+
+    private func minimizeCodeViewerToDot() {
+        guard let main = codeViewerWindow else { return }
+        codeViewerFrameBeforeMinimize = main.frame
+
+        if codeViewerDotPanel == nil {
+            setupCodeViewerDotPanel()
+        }
+        guard let dot = codeViewerDotPanel else { return }
+        // Stealth state should match the main panel's setting.
+        dot.sharingType = (appState?.settings.stealthEnabled ?? true) ? .none : .readOnly
+
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.18
+            main.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            guard let self else { return }
+            self.codeViewerWindow?.orderOut(nil)
+            dot.alphaValue = 0
+            dot.orderFrontRegardless()
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.15
+                dot.animator().alphaValue = 1.0
+            }
+        })
+    }
+
+    private func restoreCodeViewerFromDot() {
+        guard let main = codeViewerWindow, let dot = codeViewerDotPanel else { return }
+
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.15
+            dot.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            guard let self else { return }
+            dot.orderOut(nil)
+
+            if let saved = self.codeViewerFrameBeforeMinimize {
+                main.setFrame(saved, display: true)
+            }
+            main.alphaValue = 0
+            main.orderFrontRegardless()
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.2
+                main.animator().alphaValue = 1.0
+            }
+            self.codeViewerFrameBeforeMinimize = nil
+        })
+    }
+
+    private func setupCodeViewerDotPanel() {
+        let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let size: CGFloat = 44
+        // Sit to the LEFT of the main app's minimize dot so both can coexist
+        // without colliding when the user has minimized both.
+        let frame = NSRect(
+            x: screenFrame.maxX - size - 16 - size - 8,
+            y: screenFrame.minY + 16,
+            width: size, height: size
+        )
+
+        let dot = KeyablePanel(
+            contentRect: frame,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        dot.sharingType = (appState?.settings.stealthEnabled ?? true) ? .none : .readOnly
+        dot.level = .floating
+        dot.isFloatingPanel = true
+        dot.isOpaque = false
+        dot.backgroundColor = .clear
+        dot.hasShadow = false
+        dot.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        dot.isMovableByWindowBackground = true
+
+        let host = NSHostingView(rootView: CodeViewerDotView { [weak self] in
+            self?.restoreCodeViewerFromDot()
+        })
+        host.frame = dot.contentView?.bounds ?? frame
+        host.autoresizingMask = [.width, .height]
+        dot.contentView = host
+        dot.contentView?.wantsLayer = true
+        dot.contentView?.layer?.cornerRadius = size / 2
+        dot.contentView?.layer?.masksToBounds = true
+
+        codeViewerDotPanel = dot
+    }
+
     // MARK: - Onboarding Window
 
     private func showOnboardingWindow(appState: AppState) {
@@ -643,6 +847,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             diagramWindow = nil
             if appState?.showExpandedDiagram == true {
                 appState?.showExpandedDiagram = false
+            }
+        } else if win === codeViewerWindow {
+            codeViewerWindow = nil
+            if appState?.showCodeViewer == true {
+                appState?.showCodeViewer = false
             }
         } else if win === onboardingWindow {
             onboardingWindow = nil

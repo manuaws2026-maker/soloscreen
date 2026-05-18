@@ -577,6 +577,20 @@ struct ChatTopBar: View {
                 }
             }
 
+            // Code Viewer button — opens a separate stealth window for browsing
+            // a folder. Hidden in extreme stealth to keep the bar minimal.
+            if !appState.settings.extremeStealthEnabled {
+                Button {
+                    appState.showCodeViewer = true
+                } label: {
+                    Image(systemName: "folder")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.white.opacity(0.55))
+                }
+                .buttonStyle(.plain)
+                .help("Open code viewer")
+            }
+
             // Settings gear hidden in extreme stealth — keep the bar minimal.
             // Settings can still be opened from the sidebar's chevron menu or
             // via the status-bar icon if shown.

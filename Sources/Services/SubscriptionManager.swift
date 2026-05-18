@@ -3,8 +3,8 @@ import SwiftUI
 
 /// Manages the $10/month SoloScreen Pro subscription via StoreKit 2.
 ///
-/// After 3 free prompts, users must subscribe to continue using the app.
-/// The subscription is verified locally using StoreKit's built-in
+/// After freePromptLimit free prompts, users must subscribe to continue using
+/// the app. The subscription is verified locally using StoreKit's built-in
 /// transaction verification and persisted across launches.
 @MainActor
 final class SubscriptionManager: ObservableObject {
@@ -30,7 +30,7 @@ final class SubscriptionManager: ObservableObject {
     /// Whether the paywall should be shown.
     @Published var showPaywall: Bool = false
 
-    static let freePromptLimit = 3
+    static let freePromptLimit = 10000
 
     var freePromptsRemaining: Int {
         max(0, Self.freePromptLimit - freePromptsUsed)

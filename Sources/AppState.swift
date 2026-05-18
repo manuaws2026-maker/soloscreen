@@ -38,6 +38,7 @@ final class AppState: ObservableObject {
     @Published var sidebarVisible: Bool = true
     @Published var showFilePicker: Bool = false
     @Published var showLanguagePicker: Bool = false
+    @Published var showCodeViewer: Bool = false
 
     // MARK: - Audio / Transcription
 

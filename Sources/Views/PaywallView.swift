@@ -1,7 +1,7 @@
 import SwiftUI
 import StoreKit
 
-/// Full-screen paywall modal shown after 3 free prompts.
+/// Full-screen paywall modal shown after the free-prompt allowance is used.
 /// Presents the $10/month subscription with feature highlights.
 struct PaywallView: View {
     @ObservedObject var subscriptionManager = SubscriptionManager.shared
@@ -40,7 +40,7 @@ struct PaywallView: View {
                         .font(.system(size: 20, weight: .bold))
                         .foregroundStyle(.white)
 
-                    Text("You've used your 3 free prompts")
+                    Text("You've used your \(SubscriptionManager.freePromptLimit) free prompts")
                         .font(.system(size: 13))
                         .foregroundStyle(.white.opacity(0.45))
                 }
